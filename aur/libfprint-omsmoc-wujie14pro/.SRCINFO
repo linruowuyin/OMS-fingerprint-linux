@@ -23,7 +23,7 @@ pkgbase = libfprint-omsmoc-wujie14pro
 	conflicts = libfprint-omsmoc
 	options = !emptydirs
 	source = https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz
-	source = https://raw.githubusercontent.com/CHANGE_ME/omsmoc-patches/v1.94.100/omsmoc-driver.patch
+	source = https://raw.githubusercontent.com/linruowuyin/omsmoc-patches/v1.94.100/omsmoc-driver.patch
 	sha256sums = edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c
 	sha256sums = 181e3ab5d960e07763dcd45c271ef9b154a5ee7ba37a4e83320248a34b6979f2
 

@@ -1,4 +1,4 @@
-# Maintainer: 你的名字 <you@example.com>
+# Maintainer: lrwy <lrwy@users.noreply.github.com>
 #
 # 非官方构建：机械革命无界 14 Pro 的指纹驱动。
 # 适用芯片：仅 USB 33a7:2388（江西欧迈斯/欧菲光 match-on-chip）。
@@ -32,7 +32,7 @@ conflicts=('libfprint>=1.90' 'libfprint-omsmoc')
 options=('!emptydirs')
 # 补丁托管在 GitHub 的 raw 链接上（AUR 不允许随包携带本地文件）。
 # 把你自己的 GitHub 用户名填进 _ghuser，仓库名默认 omsmoc-patches，tag 用 v$pkgver。
-_ghuser=CHANGE_ME
+_ghuser=linruowuyin
 source=("https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v$pkgver/libfprint-v$pkgver.tar.gz"
         "https://raw.githubusercontent.com/$_ghuser/omsmoc-patches/v$pkgver/omsmoc-driver.patch")
 sha256sums=('edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c'
@@ -45,6 +45,9 @@ prepare() {
 
 build() {
   cd "libfprint-v$pkgver"
+  # 抹掉构建机的本地路径：否则调试信息里会留下维护者的主目录名。
+  export CFLAGS="${CFLAGS} -ffile-prefix-map=$PWD=."
+  export CXXFLAGS="${CXXFLAGS} -ffile-prefix-map=$PWD=."
   meson setup build \
     --prefix=/usr \
     --buildtype=release \
@@ -55,6 +58,20 @@ build() {
     -Dudev_rules=enabled \
     -Dudev_hwdb=enabled
   meson compile -C build
+
+  # libfprint 的 fpi-device.c 会 include 由 meson configure_file 生成的
+  # tests/fpi-test-emulation.h，其中硬编码了构建目录的绝对路径。这个字符串
+  # 会被编进主库并随包分发，泄露维护者的本地路径。
+  # -ffile-prefix-map 对它无效（那是编译期宏替换），只能直接改生成的头文件。
+  local emulation_header="build/tests/fpi-test-emulation.h"
+  if [[ -f "$emulation_header" ]]; then
+    local build_dir
+    build_dir=$(sed -n 's|^#define FPI_EMULATION_HELPER_BUILDDIR "\(.*\)"$|\1|p' "$emulation_header")
+    if [[ -n "$build_dir" ]]; then
+      sed -i "s|$build_dir|/usr/libexec/libfprint-2-tests|" "$emulation_header"
+      meson compile -C build
+    fi
+  fi
 }
 
 check() {
