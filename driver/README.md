@@ -9,6 +9,9 @@
 通过 [`setup.sh`](./setup.sh) 挂进一份干净的 libfprint 源码树里构建，
 因此这些文件将来可以直接提交上游（见 [`libfprint-oms.patch`](./libfprint-oms.patch)）。
 
+> 安装与使用见 [`docs/INSTALL.md`](../docs/INSTALL.md)；
+> 本文件聚焦**协议语义**与**硬件坑**。
+
 ---
 
 ## 1. 目录结构
@@ -23,9 +26,12 @@
 | `tests/omsmoc/custom.py` | umockdev 回归测试脚本（放进 `tests/omsmoc/`） |
 | `tests/omsmoc/custom.pcapng` | 回放数据（实测录制，芯片序列号等设备特征已脱敏） |
 | `tests/omsmoc/device` | umockdev 设备描述（`umockdev-record` 生成，同样已脱敏） |
-| `libfprint-oms.patch` | 对 libfprint 的改动（驱动/示例/测试的 meson 注册），用于本地开发树 |
+| `libfprint-oms.patch` | 对 libfprint 的 meson 注册改动（驱动/示例/测试挂载点），用于本地开发树 |
 | `upstream/` | **上游 MR 交付物**：`git format-patch` 补丁 + 提交步骤 + 可直接粘贴的 MR 描述 |
 | `setup.sh` | 拉取 libfprint、打补丁、软链源码、构建、可选跑测试 |
+
+> 完整驱动补丁（含全部源码）见 `aur/libfprint-omsmoc/omsmoc-driver.patch`；
+> 这里的小 patch 只做 meson 挂载，源码通过软链接入。
 
 ## 2. 构建
 
@@ -133,9 +139,10 @@ enroll 前的同一条 `0x32` 兼作查重（命中即报 `FP_DEVICE_ERROR_DATA_
 ## 7. 设备注意事项（与 Phase 2 结论一致，务必遵守）
 
 - **绝不要发不完整的 USBC 序列**（只发请求头、或裸发 EF01 帧都会卡死固件，已踩过两次）。
-- 该设备**扛不住内核 autosuspend**：必须常供电（`power/control=on`）。本包自带的
-  `/usr/lib/udev/rules.d/70-oms-fingerprint.rules` 就是这么做的；**不要**给这个设备加
-  `TAG+="uaccess"`（`fprintd` 以 root 运行，加了等于把芯片直连权限开放给所有本地用户）。
+- 该设备**扛不住内核 autosuspend**：必须常供电（`power/control=on`）。Arch 包内联的
+  udev 规则（安装到 `/usr/lib/udev/rules.d/70-oms-fingerprint.rules`）就是这么做的；
+  **不要**给这个设备加 `TAG+="uaccess"`（`fprintd` 以 root 运行，加了等于把芯片直连权限
+  开放给所有本地用户）。
 
   ```
   ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="33a7", ATTR{idProduct}=="2388", \

@@ -20,6 +20,10 @@ aur/*/pkg/
 # 本地发布备忘（含个人路径与发布计划）
 aur/libfprint-omsmoc-wujie14pro/PUBLISH.md
 
+# Python 缓存
+__pycache__/
+*.py[cod]
+
 # 编辑器与系统
 *.swp
 *~

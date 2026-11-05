@@ -15,25 +15,29 @@ $ fprintd-verify          → Verify result: verify-match (done)
 $ meson test omsmoc       → 1/1 drivers+custom - libfprint:omsmoc OK
 ```
 
-## Attribution
+## Contents
 
-This repository is a **derivative work** of the original driver by
-**BlueApple233** — <https://github.com/BlueApple233/OMS-fingerprint-linux>
-(licensed under LGPL-2.1-or-later). The original copyright notices are
-retained in every source file, as required by the LGPL.
-
-Modifications made here (2026-10-28):
-
-| Change | Why |
+| Document | What it covers |
 |---|---|
-| Split the `EF01` frame codec out of `omsmoc.c` into `omsmoc_proto.c/.h` | The codec became pure functions with no device or libfprint-private-header dependency, so it can be unit-tested without hardware |
-| Added `tests/test-omsmoc-proto.c` (14 test cases) | Regression coverage for the frame codec — build, parse, checksum, bounds |
-| Added `tools/oms-smoke.c` | A bring-up tool for enumerating templates on a real device |
-| Added a sanitized umockdev regression test | Lets CI verify the driver without the physical sensor |
-| Added AUR packaging and the upstream Driver Request text | Distribution and upstreaming |
+| **[Installation](docs/INSTALL.md)** | Getting the driver working on your machine — the fastest path first |
+| **[Protocol](driver/README.md)** | The reverse-engineered wire format, command semantics and hardware pitfalls |
+| **[Upstreaming](driver/upstream/README.md)** | Submitting the driver to libfprint (merge request path + issue path) |
+| **[Packaging](aur/README.md)** | Arch Linux package (local build, AUR submission) |
+| **[Attribution](#attribution)** | Derivative-work lineage and the LGPL obligations |
 
-The protocol documentation, the frame format and the driver design are the
-original author's work and are reproduced here with credit.
+## Quick start
+
+```bash
+git clone https://github.com/linruowuyin/OMS-fingerprint-linux
+cd OMS-fingerprint-linux
+driver/setup.sh --test        # fetch libfprint 1.94.100, build, run the umockdev test
+```
+
+That gives you a working `libfprint` with the driver in `build/`. To install it
+system-wide, see **[docs/INSTALL.md](docs/INSTALL.md)**.
+
+Requirements (Arch package names): `base-devel meson ninja glib2 glib2-devel
+gusb libusb cairo pixman nss gobject-introspection umockdev`.
 
 ## The device
 
@@ -71,6 +75,9 @@ timing rules and the frame checksum) are documented in
 
 ```
 README.md                  this file
+docs/
+  INSTALL.md               installation guide (build, install, verify, troubleshoot)
+  MAINTAINING.md           release checklist for the AUR package and the patch repo
 driver/                    the libfprint driver and its tooling
   omsmoc/omsmoc.c/.h       driver source (upstream style, fpi_device + fpi_ssm)
   omsmoc/omsmoc_proto.c/.h EF01 frame codec (pure functions)
@@ -79,23 +86,14 @@ driver/                    the libfprint driver and its tooling
   tests/omsmoc/            umockdev regression test + sanitized recorded traffic
   tests/sanitize-capture.py scrub device identifying data from a new recording
   upstream/                ready-to-submit upstream patch, steps and issue/request text
-  libfprint-oms.patch      same changes as a plain patch for a local build tree
+  libfprint-oms.patch      meson-only patch for a local build tree
   setup.sh                 fetch libfprint, apply patch, build, run the test
-  README.md                build, debug, test, PAM and device notes
+  README.md                protocol, command semantics, hardware notes, test coverage
 aur/                       Arch package (libfprint + this driver) as a stop-gap
 LICENSE                    LGPL-2.1-or-later
 ```
 
-## Building and testing
-
-```bash
-driver/setup.sh --test        # fetch libfprint 1.94.100, build, run the umockdev test
-```
-
-Requirements: `meson ninja gcc glib2 glib2-devel gusb libusb cairo pixman nss
-gobject-introspection umockdev` (Arch names).
-
-Hardware bring-up (real device, uses the built libfprint):
+## Hardware bring-up
 
 ```bash
 B=build/libfprint-build
@@ -120,9 +118,13 @@ builds there without warnings and passes the replay test. Not submitted yet.
   (`power/control=on`) while a driver is being developed or used, e.g.
 
   ```
-  ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="33a7", ATTR{idProduct}=="2388", \
-      TAG+="uaccess", ATTR{power/control}="on"
+  ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="33a7", ATTR{idProduct}=="2388", \\
+      ATTR{power/control}="on"
   ```
+
+  Do **not** add `TAG+="uaccess"` here: `fprintd` runs as root, so that would
+  hand raw device access — including the ability to erase chip templates — to
+  every local user.
 
 * A wedged device (bulk transfers time out, enumeration still fine) recovers
   with a USB port reset, which can be done without root:
@@ -140,6 +142,26 @@ No vendor binaries, firmware or raw captures are included in this repository;
 the test recording shipped in `driver/tests/` has device identifying data
 (chip serial, USB serial) removed. If you want to reproduce the captures, use
 your own device and the vendor driver obtained from your hardware vendor.
+
+## Attribution
+
+This repository is a **derivative work** of the original driver by
+**BlueApple233** — <https://github.com/BlueApple233/OMS-fingerprint-linux>
+(licensed under LGPL-2.1-or-later). The original copyright notices are
+retained in every source file, as required by the LGPL.
+
+Modifications made here (2026-10-28):
+
+| Change | Why |
+|---|---|
+| Split the `EF01` frame codec out of `omsmoc.c` into `omsmoc_proto.c/.h` | The codec became pure functions with no device or libfprint-private-header dependency, so it can be unit-tested without hardware |
+| Added `tests/test-omsmoc-proto.c` (14 test cases) | Regression coverage for the frame codec — build, parse, checksum, bounds |
+| Added `tools/oms-smoke.c` | A bring-up tool for enumerating templates on a real device |
+| Added a sanitized umockdev regression test | Lets CI verify the driver without the physical sensor |
+| Added AUR packaging and the upstream Driver Request text | Distribution and upstreaming |
+
+The protocol documentation, the frame format and the driver design are the
+original author's work and are reproduced here with credit.
 
 ## License
 

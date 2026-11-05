@@ -2,6 +2,9 @@
 
 本目录是**可直接提交上游**的补丁与说明。
 
+> 想先在本地用起来？见 [docs/INSTALL.md](../../docs/INSTALL.md)。
+> 发布/发版流程见 [docs/MAINTAINING.md](../../docs/MAINTAINING.md)。
+
 ## 1. 补丁内容
 
 `0001-drivers-Add-support-for-OMS-match-on-chip-sensors.patch`
@@ -24,7 +27,7 @@
 
 > ⚠️ **上游会追问的一点**：生成的 hwdb 会给所有受支持设备写 `ID_AUTOSUSPEND=1`，
 > 但这颗芯片实测扛不住 autosuspend。发行版里靠一条 `power/control=on` 的 udev 规则兜底
-> （见 `aur/libfprint-omsmoc/70-oms-fingerprint.rules`）；要真正进上游，得让驱动实现
+> （写在 `aur/libfprint-omsmoc/PKGBUILD` 的 `package()` 里）；要真正进上游，得让驱动实现
 > 复位/恢复，或给 hwdb 生成器加例外。这一点建议在 MR 描述里主动写明。
 
 ## 2. 提交步骤（fork + MR）
