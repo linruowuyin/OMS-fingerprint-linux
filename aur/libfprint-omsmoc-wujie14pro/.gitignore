@@ -1,0 +1,6 @@
+pkg/
+src/
+*.pkg.tar.zst
+*.tar.gz
+PUBLISH.md
+set-github-user.sh

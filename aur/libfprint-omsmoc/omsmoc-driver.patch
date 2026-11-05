@@ -1,0 +1,3502 @@
+diff --git a/examples/meson.build b/examples/meson.build
+index 250c055..322fbf0 100644
+--- a/examples/meson.build
++++ b/examples/meson.build
+@@ -18,6 +18,14 @@ foreach example: examples
+     )
+ endforeach
+ 
++executable('oms-smoke',
++    'oms-smoke.c',
++    dependencies: [
++        libfprint_dep,
++        glib_dep,
++    ],
++)
++
+ executable('cpp-test',
+     'cpp-test.cpp',
+     dependencies: libfprint_dep,
+diff --git a/examples/oms-smoke.c b/examples/oms-smoke.c
+new file mode 100644
+index 0000000..3719ad4
+--- /dev/null
++++ b/examples/oms-smoke.c
+@@ -0,0 +1,649 @@
++/*
++ * OMS driver bring-up tool
++ * Copyright (C) 2026 The OMS Linux driver contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Small companion tool for bring-up and manual testing of the omsmoc driver
++ * without fprintd.  It uses the public libfprint API only.
++ *
++ *   oms-smoke info                 open/close the device, print the driver state
++ *   oms-smoke verify [seconds]     verify a print against the chip
++ *   oms-smoke identify [seconds]   identify a finger through the chip
++ *
++ * The verify/identify commands wait for a finger press and stop after the
++ * given number of seconds (default 20).
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <libfprint/fprint.h>
++#include <glib-unix.h>
++
++typedef enum {
++  COMMAND_INFO,
++  COMMAND_VERIFY,
++  COMMAND_IDENTIFY,
++  COMMAND_ENROLL,
++  COMMAND_LIST,
++  COMMAND_DELETE,
++  COMMAND_CLEAR,
++} SmokeCommand;
++
++typedef struct
++{
++  GMainLoop      *loop;
++  GCancellable   *cancellable;
++  FpPrint        *print;
++  SmokeCommand    command;
++  guint           slot;
++  gboolean        slot_given;
++  guint           timeout_seconds;
++  guint           timeout_id;
++  int             ret_value;
++} SmokeData;
++
++static void
++smoke_data_free (SmokeData *data)
++{
++  g_clear_handle_id (&data->timeout_id, g_source_remove);
++  g_clear_object (&data->print);
++  g_clear_object (&data->cancellable);
++  g_clear_pointer (&data->loop, g_main_loop_unref);
++  g_free (data);
++}
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (SmokeData, smoke_data_free)
++
++static void
++on_device_closed (FpDevice     *device,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(GError) error = NULL;
++
++  fp_device_close_finish (device, result, &error);
++  if (error)
++    g_warning ("Failed to close device: %s", error->message);
++
++  g_main_loop_quit (data->loop);
++}
++
++static void
++quit (FpDevice  *device,
++      SmokeData *data)
++{
++  if (!fp_device_is_open (device))
++    {
++      g_main_loop_quit (data->loop);
++      return;
++    }
++
++  fp_device_close (device, NULL, (GAsyncReadyCallback) on_device_closed, data);
++}
++
++static gboolean
++on_timeout (gpointer user_data)
++{
++  SmokeData *data = user_data;
++
++  g_print ("\nTimeout reached, cancelling.\n");
++  data->timeout_id = 0;
++  g_cancellable_cancel (data->cancellable);
++
++  return G_SOURCE_REMOVE;
++}
++
++static gboolean
++on_sigint (gpointer user_data)
++{
++  SmokeData *data = user_data;
++
++  g_cancellable_cancel (data->cancellable);
++
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++start_action (FpDevice  *device,
++              SmokeData *data);
++
++static void
++on_verify_done (FpDevice     *device,
++                GAsyncResult *result,
++                gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(FpPrint) matched_print = NULL;
++  g_autoptr(FpPrint) scanned_print = NULL;
++  g_autoptr(GError) error = NULL;
++  gboolean matched = FALSE;
++
++  if (!fp_device_verify_finish (device, result, &matched, &scanned_print, &error) &&
++      error->domain != FP_DEVICE_RETRY)
++    {
++      g_warning ("Verify failed: %s", error->message);
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  if (error)
++    g_print ("Verify reported a retry condition: %s\n", error->message);
++
++  if (matched)
++    {
++      g_print ("VERIFY: MATCH (finger presented was recognised)\n");
++      data->ret_value = EXIT_SUCCESS;
++      quit (device, data);
++      return;
++    }
++
++  g_print ("VERIFY: no match, press the registered finger again? [Y/n] ");
++
++  {
++    char buffer[20];
++
++    if (!fgets (buffer, sizeof (buffer), stdin) ||
++        (buffer[0] != 'Y' && buffer[0] != 'y' && buffer[0] != '\n'))
++      {
++        data->ret_value = EXIT_FAILURE;
++        quit (device, data);
++        return;
++      }
++  }
++
++  g_cancellable_reset (data->cancellable);
++  start_action (device, data);
++}
++
++static void
++on_identify_report (FpDevice  *device,
++                    FpPrint   *match,
++                    FpPrint   *print,
++                    gpointer   user_data,
++                    GError    *error)
++{
++  if (error)
++    {
++      g_print ("Identify report (retry): %s\n", error->message);
++      return;
++    }
++
++  if (match)
++    g_print ("Identify report: MATCH\n");
++  else
++    g_print ("Identify report: no match\n");
++}
++
++static void
++on_identify_done (FpDevice     *device,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(FpPrint) matched_print = NULL;
++  g_autoptr(FpPrint) scanned_print = NULL;
++  g_autoptr(GError) error = NULL;
++
++  if (!fp_device_identify_finish (device, result,
++                                  &matched_print, &scanned_print, &error) &&
++      error->domain != FP_DEVICE_RETRY)
++    {
++      g_warning ("Identify failed: %s", error->message);
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  if (error)
++    g_print ("Identify reported a retry condition: %s\n", error->message);
++
++  if (matched_print)
++    {
++      g_print ("IDENTIFY: MATCH\n");
++      data->ret_value = EXIT_SUCCESS;
++      quit (device, data);
++      return;
++    }
++
++  g_print ("IDENTIFY: no match, try again? [Y/n] ");
++
++  {
++    char buffer[20];
++
++    if (!fgets (buffer, sizeof (buffer), stdin) ||
++        (buffer[0] != 'Y' && buffer[0] != 'y' && buffer[0] != '\n'))
++      {
++        data->ret_value = EXIT_FAILURE;
++        quit (device, data);
++        return;
++      }
++  }
++
++  g_cancellable_reset (data->cancellable);
++  start_action (device, data);
++}
++
++static void
++on_enroll_progress (FpDevice     *device,
++                    gint          completed_stages,
++                    FpPrint      *print,
++                    gpointer      user_data,
++                    GError       *error)
++{
++  if (error)
++    g_print ("Enroll progress %d: %s\n", completed_stages, error->message);
++  else
++    g_print ("Enroll progress: %d/%d stages\n", completed_stages,
++             fp_device_get_nr_enroll_stages (device));
++}
++
++static void
++on_enroll_done (FpDevice     *device,
++                GAsyncResult *result,
++                gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(FpPrint) print = NULL;
++  g_autoptr(GError) error = NULL;
++
++  print = fp_device_enroll_finish (device, result, &error);
++  if (!print)
++    {
++      g_warning ("Enroll failed: %s", error->message);
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  g_print ("ENROLL: done (finger %d, description '%s')\n",
++           (int) fp_print_get_finger (print),
++           fp_print_get_description (print) ? fp_print_get_description (print) : "");
++
++  data->ret_value = EXIT_SUCCESS;
++  quit (device, data);
++}
++
++static void
++on_clear_done (FpDevice     *device,
++               GAsyncResult *result,
++               gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(GError) error = NULL;
++
++  if (!fp_device_clear_storage_finish (device, result, &error))
++    {
++      g_warning ("Clear storage failed: %s", error->message);
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  g_print ("CLEAR: done\n");
++  data->ret_value = EXIT_SUCCESS;
++  quit (device, data);
++}
++
++static void
++on_delete_done (FpDevice     *device,
++                GAsyncResult *result,
++                gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(GError) error = NULL;
++
++  if (!fp_device_delete_print_finish (device, result, &error))
++    {
++      g_warning ("Delete failed: %s", error->message);
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  g_print ("DELETE: slot %u removed\n", data->slot);
++  data->ret_value = EXIT_SUCCESS;
++  quit (device, data);
++}
++
++static void
++on_list_for_delete (FpDevice     *device,
++                    GAsyncResult *result,
++                    gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(GPtrArray) prints = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autofree gchar *wanted = NULL;
++  guint i;
++
++  prints = fp_device_list_prints_finish (device, result, &error);
++  if (!prints)
++    {
++      g_warning ("List failed: %s", error->message);
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  wanted = g_strdup_printf ("Slot %u", data->slot);
++
++  for (i = 0; i < prints->len; i++)
++    {
++      FpPrint *print = g_ptr_array_index (prints, i);
++      g_autofree gchar *description = NULL;
++
++      g_object_get (print, "description", &description, NULL);
++      if (g_strcmp0 (description, wanted) == 0)
++        {
++          g_print ("Deleting template in slot %u\n", data->slot);
++          fp_device_delete_print (device, print, data->cancellable,
++                                  (GAsyncReadyCallback) on_delete_done, data);
++          return;
++        }
++    }
++
++  g_warning ("No template in slot %u", data->slot);
++  data->ret_value = EXIT_FAILURE;
++  quit (device, data);
++}
++
++static void
++on_list_done (FpDevice     *device,
++              GAsyncResult *result,
++              gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(GPtrArray) prints = NULL;
++  g_autoptr(GError) error = NULL;
++  guint i;
++
++  prints = fp_device_list_prints_finish (device, result, &error);
++  if (!prints)
++    {
++      g_warning ("List failed: %s", error->message);
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  g_print ("%u template(s) on the device:\n", prints->len);
++  for (i = 0; i < prints->len; i++)
++    {
++      FpPrint *print = g_ptr_array_index (prints, i);
++      g_autofree gchar *description = NULL;
++
++      g_object_get (print, "description", &description, NULL);
++      g_print ("  - %s\n", description ? description : "(no description)");
++    }
++
++  data->ret_value = EXIT_SUCCESS;
++  quit (device, data);
++}
++
++static void
++on_verify_listed (FpDevice     *device,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(GPtrArray) prints = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autofree gchar *wanted = NULL;
++  FpPrint *print = NULL;
++  guint i;
++
++  prints = fp_device_list_prints_finish (device, result, &error);
++  if (!prints || prints->len == 0)
++    {
++      g_warning ("No prints on the device: %s", error ? error->message : "storage empty");
++      data->ret_value = EXIT_FAILURE;
++      quit (device, data);
++      return;
++    }
++
++  if (data->slot_given)
++    {
++      wanted = g_strdup_printf ("Slot %u", data->slot);
++
++      for (i = 0; i < prints->len; i++)
++        {
++          g_autofree gchar *description = NULL;
++
++          g_object_get (g_ptr_array_index (prints, i), "description", &description, NULL);
++          if (g_strcmp0 (description, wanted) == 0)
++            break;
++        }
++
++      if (i == prints->len)
++        {
++          g_warning ("No template in slot %u", data->slot);
++          data->ret_value = EXIT_FAILURE;
++          quit (device, data);
++          return;
++        }
++    }
++  else
++    {
++      i = 0;
++    }
++
++  print = g_ptr_array_index (prints, i);
++  g_print ("Press the finger enrolled in '%s' (timeout %u s)...\n",
++           fp_print_get_description (print) ? fp_print_get_description (print) : "?",
++           data->timeout_seconds);
++
++  g_set_object (&data->print, print);
++  fp_device_verify (device, print, data->cancellable,
++                    NULL, NULL, NULL,
++                    (GAsyncReadyCallback) on_verify_done, data);
++}
++
++static void
++start_action (FpDevice  *device,
++              SmokeData *data)
++{
++  data->timeout_id = g_timeout_add_seconds (data->timeout_seconds, on_timeout, data);
++
++  switch (data->command)
++    {
++    case COMMAND_INFO:
++      g_print ("Driver: %s\n", fp_device_get_driver (device));
++      g_print ("Device: %s (%s)\n", fp_device_get_name (device),
++               fp_device_get_device_id (device));
++      g_print ("Scan type: %s\n",
++               fp_device_get_scan_type (device) == FP_SCAN_TYPE_PRESS ? "press" : "swipe");
++      g_print ("Enroll stages: %u\n", fp_device_get_nr_enroll_stages (device));
++      data->ret_value = EXIT_SUCCESS;
++      quit (device, data);
++      break;
++
++    case COMMAND_ENROLL:
++      g_clear_object (&data->print);
++      data->print = fp_print_new (device);
++      fp_print_set_finger (data->print, FP_FINGER_LEFT_INDEX);
++      g_print ("Enrolling a new finger, press and lift the finger for every "
++               "stage (timeout %u s)...\n", data->timeout_seconds);
++      fp_device_enroll (device, data->print, data->cancellable,
++                        on_enroll_progress, data, NULL,
++                        (GAsyncReadyCallback) on_enroll_done, data);
++      break;
++
++    case COMMAND_VERIFY:
++      /* Verification needs a print that is stored on the device, as the
++       * slot it refers to must match the slot the chip reports. */
++      fp_device_list_prints (device, data->cancellable,
++                             (GAsyncReadyCallback) on_verify_listed, data);
++      break;
++
++    case COMMAND_IDENTIFY:
++      {
++        g_autoptr(GPtrArray) gallery = g_ptr_array_new_with_free_func (g_object_unref);
++
++        g_print ("Press any finger enrolled on the chip (timeout %u s)...\n",
++                 data->timeout_seconds);
++        fp_device_identify (device, gallery, data->cancellable,
++                            on_identify_report, data, NULL,
++                            (GAsyncReadyCallback) on_identify_done, data);
++      }
++      break;
++
++    case COMMAND_LIST:
++      fp_device_list_prints (device, data->cancellable,
++                             (GAsyncReadyCallback) on_list_done, data);
++      break;
++
++    case COMMAND_DELETE:
++      fp_device_list_prints (device, data->cancellable,
++                             (GAsyncReadyCallback) on_list_for_delete, data);
++      break;
++
++    case COMMAND_CLEAR:
++      g_print ("Clearing the chip storage (all templates!)...\n");
++      fp_device_clear_storage (device, data->cancellable,
++                               (GAsyncReadyCallback) on_clear_done, data);
++      break;
++    }
++}
++
++static void
++on_device_opened (FpDevice     *device,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  SmokeData *data = user_data;
++  g_autoptr(GError) error = NULL;
++
++  if (!fp_device_open_finish (device, result, &error))
++    {
++      g_warning ("Failed to open device: %s", error->message);
++      quit (device, data);
++      return;
++    }
++
++  start_action (device, data);
++}
++
++int
++main (int   argc,
++      char *argv[])
++{
++  g_autoptr(FpContext) ctx = NULL;
++  g_autoptr(SmokeData) data = NULL;
++  GPtrArray *devices;
++  FpDevice *device = NULL;
++  const char *command = "info";
++  guint i;
++
++  data = g_new0 (SmokeData, 1);
++  data->ret_value = EXIT_FAILURE;
++  data->timeout_seconds = 20;
++
++  if (argc > 1)
++    command = argv[1];
++
++  if (g_strcmp0 (command, "info") == 0)
++    data->command = COMMAND_INFO;
++  else if (g_strcmp0 (command, "verify") == 0)
++    data->command = COMMAND_VERIFY;
++  else if (g_strcmp0 (command, "identify") == 0)
++    data->command = COMMAND_IDENTIFY;
++  else if (g_strcmp0 (command, "enroll") == 0)
++    data->command = COMMAND_ENROLL;
++  else if (g_strcmp0 (command, "list") == 0)
++    data->command = COMMAND_LIST;
++  else if (g_strcmp0 (command, "delete") == 0)
++    data->command = COMMAND_DELETE;
++  else if (g_strcmp0 (command, "clear") == 0)
++    data->command = COMMAND_CLEAR;
++  else
++    {
++      g_printerr ("Usage: %s [info|verify|identify|enroll|list|delete <slot>|clear] "
++                  "[timeout seconds]\n", argv[0]);
++      return EXIT_FAILURE;
++    }
++
++  if (data->command == COMMAND_DELETE)
++    {
++      if (argc < 3)
++        {
++          g_printerr ("delete needs a slot number\n");
++          return EXIT_FAILURE;
++        }
++      data->slot = (guint) MAX (0, atoi (argv[2]));
++      data->slot_given = TRUE;
++      if (argc > 3)
++        data->timeout_seconds = (guint) MAX (1, atoi (argv[3]));
++    }
++  else
++    {
++      int arg;
++
++      for (arg = 2; arg < argc; arg++)
++        {
++          if (g_strcmp0 (argv[arg], "--slot") == 0 && arg + 1 < argc)
++            {
++              /* Note: increment first, MAX() would evaluate the argument twice. */
++              arg++;
++              data->slot = (guint) MAX (0, atoi (argv[arg]));
++              data->slot_given = TRUE;
++            }
++          else if (atoi (argv[arg]) > 0)
++            {
++              data->timeout_seconds = (guint) atoi (argv[arg]);
++            }
++        }
++    }
++
++  ctx = fp_context_new ();
++  devices = fp_context_get_devices (ctx);
++  if (!devices || devices->len == 0)
++    {
++      g_printerr ("No fingerprint devices found.\n");
++      return EXIT_FAILURE;
++    }
++
++  for (i = 0; i < devices->len; i++)
++    {
++      FpDevice *candidate = g_ptr_array_index (devices, i);
++
++      if (g_strcmp0 (fp_device_get_driver (candidate), "omsmoc") == 0)
++        {
++          device = candidate;
++          break;
++        }
++    }
++
++  if (!device)
++    {
++      g_printerr ("No omsmoc device found (is the module connected?).\n");
++      return EXIT_FAILURE;
++    }
++
++  data->loop = g_main_loop_new (NULL, FALSE);
++  data->cancellable = g_cancellable_new ();
++  g_unix_signal_add_full (G_PRIORITY_HIGH, SIGINT, on_sigint, data, NULL);
++
++  fp_device_open (device, data->cancellable,
++                  (GAsyncReadyCallback) on_device_opened, data);
++  g_main_loop_run (data->loop);
++
++  return data->ret_value;
++}
+diff --git a/libfprint/drivers/omsmoc/omsmoc.c b/libfprint/drivers/omsmoc/omsmoc.c
+new file mode 100644
+index 0000000..0f12ef2
+--- /dev/null
++++ b/libfprint/drivers/omsmoc/omsmoc.c
+@@ -0,0 +1,1811 @@
++/*
++ * OMS Match-on-Chip driver for libfprint
++ * Copyright (C) 2026 The OMS Linux driver contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Reverse engineered driver for the Jiangxi OMS Microelectronics
++ * fingerprint module (33a7:2388).  The protocol was reconstructed from the
++ * vendor Windows driver and verified against usbmon captures of the vendor
++ * driver as well as with a pyusb prototype on the real hardware.
++ *
++ * The transport consists of two layers:
++ *
++ *   1. An 8 byte "USBC" request header (host -> device, bulk OUT):
++ *        55 53 42 43 | dir | size | 00 00
++ *        dir = 0x00: the host will write `size` bytes afterwards
++ *        dir = 0x80: request that the device returns at most `size` bytes
++ *      The device acknowledges every request with a 4 byte "USBS" reply.
++ *
++ *   2. A 64 byte EF01 frame, padded with 0x00:
++ *        EF 01 FF FF | FF FF | kind | 00 | L | data[L]
++ *        kind = 0x01 request / 0x07 response
++ *        the last two bytes of data are sum (frame[6 : 9 + L - 2]),
++ *        stored big endian.
++ *
++ * A command transaction is therefore:
++ *   OUT USBC(00, 64) -> OUT 64 byte command frame -> IN USBS
++ *   -> OUT USBC(80, 64) -> IN 64 byte response frame -> IN USBS
++ *
++ * The device answers a read request with the ack alone when it has no data
++ * to report yet.  Identify results are polled with 32 byte windows.
++ *
++ * Everything runs in plain text: neither the vendor driver nor this driver
++ * performs a handshake, a key exchange or any encryption.
++ */
++
++#define FP_COMPONENT "omsmoc"
++
++#include "drivers_api.h"
++
++#include "omsmoc.h"
++#include "omsmoc_proto.h"
++
++/* USB identifiers */
++#define OMS_VENDOR_ID  0x33a7
++#define OMS_PRODUCT_ID 0x2388
++
++/* Bulk endpoints */
++#define OMS_EP_OUT (0x01 | FPI_USB_ENDPOINT_OUT)
++#define OMS_EP_IN  (0x81 | FPI_USB_ENDPOINT_IN)
++
++/* Transport layer */
++#define OMS_USBC_SIZE   8
++#define OMS_USBS_SIZE   4
++#define OMS_DIR_WRITE   0x00
++#define OMS_DIR_READ    0x80
++#define OMS_POLL_SIZE   32
++
++/* EF01 帧的常量与编解码在 omsmoc_proto.h / omsmoc_proto.c，
++ * 拆开是为了让帧层能脱离硬件和 libfprint 私有头文件做单元测试。 */
++
++/* Timeouts and pacing (the vendor driver polls the device every ~60 ms) */
++#define OMS_CMD_TIMEOUT_MS    2000
++#define OMS_POLL_TIMEOUT_MS   200
++#define OMS_READ_DELAY_MS     60
++#define OMS_POLL_INTERVAL_MS  60
++#define OMS_MAX_SESSION_RETRY 10
++#define OMS_MAX_READ_RETRY    5
++#define OMS_MAX_DRAIN_READS   8
++#define OMS_MAX_CAPTURE_POLLS     1200  /* ~72 s waiting for a finger press */
++#define OMS_MAX_CAPTURE_END_POLLS 30    /* ~1.8 s to finish the capture */
++#define OMS_MAX_ENROLL_POLLS      1200  /* ~72 s between two finger presses */
++
++/* Number of finger presses the chip expects during enrollment */
++#define OMS_ENROLL_STAGES 6
++
++/* Commands (all verified against usbmon captures of the vendor driver) */
++typedef enum {
++  OMS_CMD_TEMPLATE_OP  = 0x0c,
++  OMS_CMD_TEMPLATE_NUM = 0x1d,
++  OMS_CMD_INDEX_TABLE  = 0x1f,
++  OMS_CMD_CANCEL       = 0x30,
++  OMS_CMD_ENROLL       = 0x31,
++  OMS_CMD_IDENTIFY     = 0x32,
++  OMS_CMD_CHIP_SN      = 0x34,
++} OmsCommand;
++
++/* AutoIdentify (0x32) response payloads, verified on hardware:
++ *
++ *   00 00 XX XX 00 00   waiting for a finger (XX XX echoes the parameters)
++ *   00 01 XX XX 00 00   finger image captured, the result is still pending
++ *   00 05 00 SS 03 e8   matched an enrolled template, SS is its slot
++ *   09 05 FF FF 00 00   the search finished without a match
++ *
++ * Note that "00 01" alone does *not* mean that the finger was recognised:
++ * an unenrolled finger produces it as well, followed by "09 05". The two
++ * parameter bytes are echoed by the chip but do not restrict the search.
++ */
++#define OMS_ID_STATUS_OK      0x00
++#define OMS_ID_STATUS_NOMATCH 0x09
++#define OMS_ID_RESULT_CAPTURED 0x01
++#define OMS_ID_RESULT_MATCHED  0x05
++#define OMS_ID_PAYLOAD_SLOT    3
++
++/* Enroll progress matrix */
++#define OMS_ENROLL_TRAILER_INDEX 6
++
++struct _FpiDeviceOmsMoc
++{
++  FpDevice parent;
++
++  FpiSsm   *task_ssm;
++
++  /* Buffers of the transaction currently on the wire */
++  guint8    usbc[OMS_USBC_SIZE];
++  guint8    out_frame[OMS_PACKET_SIZE];
++  guint8    in_data[OMS_PACKET_SIZE];
++  gsize     in_len;
++  guint8    ack[OMS_USBS_SIZE];
++
++  /* Cached device state */
++  guint8    nr_templates;
++  guint16   template_bitmap;
++
++  /* Identify/verify bookkeeping */
++  gint      matched_slot;       /* slot the chip matched, -1 for "no match" */
++  gboolean  result_received;
++  GError   *action_error;
++  guint     session_retries;
++  guint     read_retries;
++
++  /* Enroll bookkeeping */
++  gboolean  captured;
++  guint8    enroll_slot;
++  guint8    enroll_level;
++  guint     poll_count;
++  guint     capture_retries;
++};
++
++G_DEFINE_TYPE (FpiDeviceOmsMoc, fpi_device_omsmoc, FP_TYPE_DEVICE)
++
++typedef void (*OmsCallback) (FpiDeviceOmsMoc *self, GError *error);
++
++/* ------------------------------------------------------------------ *
++ * Protocol helpers
++ * ------------------------------------------------------------------ */
++
++static void
++oms_fill_usbc (guint8 *buf,
++               guint8  direction,
++               guint8  size)
++{
++  buf[0] = 'U';
++  buf[1] = 'S';
++  buf[2] = 'B';
++  buf[3] = 'C';
++  buf[4] = direction;
++  buf[5] = size;
++  buf[6] = 0x00;
++  buf[7] = 0x00;
++}
++
++/* 帧的构造/解析/空包判断在 omsmoc_proto.c（声明见 omsmoc_proto.h）。 */
++
++/* ------------------------------------------------------------------ *
++ * USB transfers
++ * ------------------------------------------------------------------ */
++
++typedef struct
++{
++  OmsCallback callback;
++  guint       window;
++  guint       timeout_ms;
++  gboolean    cancelable;
++} OmsTransferData;
++
++static void
++oms_usbs_cb (FpiUsbTransfer *transfer,
++             FpDevice       *device,
++             gpointer        user_data,
++             GError         *error)
++{
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  if (transfer->actual_length != OMS_USBS_SIZE ||
++      memcmp (transfer->buffer, "USBS", OMS_USBS_SIZE) != 0)
++    {
++      fpi_ssm_mark_failed (transfer->ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "Invalid USBS acknowledgement"));
++      return;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++/* Command transfers: USBC write header + command frame + USBS, followed by
++ * an optional response read (USBC read header + data + USBS). */
++enum {
++  OMS_CMD_SEND_HEADER,
++  OMS_CMD_SEND_FRAME,
++  OMS_CMD_WAIT_ACK,
++  OMS_CMD_READ_DELAY,
++  OMS_CMD_SEND_READ_HEADER,
++  OMS_CMD_READ_DATA,
++  OMS_CMD_READ_ACK,
++  OMS_CMD_COMPLETE,
++  OMS_CMD_NUM_STATES,
++};
++
++/* Read transfers: USBC read header + data + USBS */
++enum {
++  OMS_READ_SEND_HEADER,
++  OMS_READ_WAIT_DATA,
++  OMS_READ_WAIT_ACK,
++  OMS_READ_COMPLETE,
++  OMS_READ_NUM_STATES,
++};
++
++static void
++oms_data_cb (FpiUsbTransfer *transfer,
++             FpDevice       *device,
++             gpointer        user_data,
++             GError         *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  gint final_state = GPOINTER_TO_INT (user_data);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  self->in_len = transfer->actual_length;
++
++  /* The device may answer a read request with the ack alone, in which case
++   * no separate USBS transfer follows. */
++  if (self->in_len == OMS_USBS_SIZE &&
++      memcmp (self->in_data, "USBS", OMS_USBS_SIZE) == 0)
++    {
++      self->in_len = 0;
++      fpi_ssm_jump_to_state (transfer->ssm, final_state);
++      return;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++oms_cmd_data_cb (FpiUsbTransfer *transfer,
++                 FpDevice       *device,
++                 gpointer        user_data,
++                 GError         *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  self->in_len = transfer->actual_length;
++
++  if (self->in_len == OMS_USBS_SIZE &&
++      memcmp (self->in_data, "USBS", OMS_USBS_SIZE) == 0)
++    {
++      self->in_len = 0;
++      fpi_ssm_jump_to_state (transfer->ssm, OMS_CMD_COMPLETE);
++      return;
++    }
++
++  if ((self->in_len == 0 || oms_data_is_empty (self->in_data, self->in_len)) &&
++      self->read_retries++ < OMS_MAX_READ_RETRY)
++    {
++      /* The device was not ready to answer yet, ask again. */
++      fpi_ssm_jump_to_state_delayed (transfer->ssm, OMS_CMD_SEND_READ_HEADER,
++                                     OMS_READ_DELAY_MS);
++      return;
++    }
++
++  fpi_ssm_next_state (transfer->ssm);
++}
++
++static void
++oms_cmd_run_state (FpiSsm   *ssm,
++                   FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiUsbTransfer *transfer;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_CMD_SEND_HEADER:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->usbc,
++                                       OMS_USBC_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_CMD_SEND_FRAME:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->out_frame,
++                                       OMS_PACKET_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_CMD_WAIT_ACK:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->ack,
++                                       OMS_USBS_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_usbs_cb, NULL);
++      break;
++
++    case OMS_CMD_READ_DELAY:
++      if (data->window == 0)
++        {
++          fpi_ssm_jump_to_state (ssm, OMS_CMD_COMPLETE);
++          break;
++        }
++
++      /* The device needs a moment to prepare the response; the vendor
++       * driver waits about 64 ms before it requests it. */
++      self->read_retries = 0;
++      fpi_ssm_next_state_delayed (ssm, OMS_READ_DELAY_MS);
++      break;
++
++    case OMS_CMD_SEND_READ_HEADER:
++      oms_fill_usbc (self->usbc, OMS_DIR_READ, data->window);
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->usbc,
++                                       OMS_USBC_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_CMD_READ_DATA:
++      self->in_len = 0;
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = FALSE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->in_data,
++                                       data->window, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_cmd_data_cb, NULL);
++      break;
++
++    case OMS_CMD_READ_ACK:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->ack,
++                                       OMS_USBS_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_usbs_cb, NULL);
++      break;
++
++    case OMS_CMD_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_read_run_state (FpiSsm   *ssm,
++                    FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiUsbTransfer *transfer;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_READ_SEND_HEADER:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_OUT, self->usbc,
++                                       OMS_USBC_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               fpi_ssm_usb_transfer_cb, NULL);
++      break;
++
++    case OMS_READ_WAIT_DATA:
++      self->in_len = 0;
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = FALSE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->in_data,
++                                       data->window, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms,
++                               data->cancelable ? fpi_device_get_cancellable (device) : NULL,
++                               oms_data_cb, GINT_TO_POINTER (OMS_READ_COMPLETE));
++      break;
++
++    case OMS_READ_WAIT_ACK:
++      transfer = fpi_usb_transfer_new (device);
++      transfer->ssm = ssm;
++      transfer->short_is_error = TRUE;
++      fpi_usb_transfer_fill_bulk_full (transfer, OMS_EP_IN, self->ack,
++                                       OMS_USBS_SIZE, NULL);
++      fpi_usb_transfer_submit (transfer, data->timeout_ms, NULL,
++                               oms_usbs_cb, NULL);
++      break;
++
++    case OMS_READ_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_cmd_ssm_done (FpiSsm   *ssm,
++                  FpDevice *device,
++                  GError   *error)
++{
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  if (data->callback)
++    data->callback (self, error);
++}
++
++static void
++oms_read_ssm_done (FpiSsm   *ssm,
++                   FpDevice *device,
++                   GError   *error)
++{
++  OmsTransferData *data = fpi_ssm_get_data (ssm);
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  if (data->callback)
++    data->callback (self, error);
++}
++
++static void
++oms_command (FpiDeviceOmsMoc *self,
++             guint8           cmd,
++             const guint8    *params,
++             gsize            params_len,
++             guint8           window,
++             OmsCallback      callback)
++{
++  FpiSsm *ssm;
++  OmsTransferData *data;
++
++  oms_build_frame (self->out_frame, cmd, params, params_len);
++  oms_fill_usbc (self->usbc, OMS_DIR_WRITE, OMS_PACKET_SIZE);
++
++  data = g_new0 (OmsTransferData, 1);
++  data->callback = callback;
++  data->window = window;
++  data->timeout_ms = OMS_CMD_TIMEOUT_MS;
++
++  ssm = fpi_ssm_new (FP_DEVICE (self), oms_cmd_run_state, OMS_CMD_NUM_STATES);
++  fpi_ssm_set_data (ssm, data, g_free);
++
++  fpi_ssm_start (ssm, oms_cmd_ssm_done);
++}
++
++static void
++oms_read (FpiDeviceOmsMoc *self,
++          guint8           window,
++          guint            timeout_ms,
++          gboolean         cancelable,
++          OmsCallback      callback)
++{
++  FpiSsm *ssm;
++  OmsTransferData *data;
++
++  g_return_if_fail (window <= OMS_PACKET_SIZE);
++
++  oms_fill_usbc (self->usbc, OMS_DIR_READ, window);
++
++  data = g_new0 (OmsTransferData, 1);
++  data->callback = callback;
++  data->window = window;
++  data->timeout_ms = timeout_ms;
++  data->cancelable = cancelable;
++
++  ssm = fpi_ssm_new (FP_DEVICE (self), oms_read_run_state, OMS_READ_NUM_STATES);
++  fpi_ssm_set_data (ssm, data, g_free);
++
++  fpi_ssm_start (ssm, oms_read_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Initialization
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_INIT_DRAIN,
++  OMS_INIT_CHIP_SN,
++  OMS_INIT_TEMPLATE_NUM,
++  OMS_INIT_INDEX_TABLE,
++  OMS_INIT_NUM_STATES,
++};
++
++static void
++oms_init_cb (FpiDeviceOmsMoc *self,
++             GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++
++  if (error)
++    {
++      /* A timeout while draining just means that there was nothing left. */
++      if (fpi_ssm_get_cur_state (ssm) == OMS_INIT_DRAIN &&
++          g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          g_error_free (error);
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_INIT_DRAIN:
++      /* Discard whatever a previous session left in the device queue. */
++      if (!oms_data_is_empty (self->in_data, self->in_len) &&
++          self->read_retries++ < OMS_MAX_DRAIN_READS)
++        {
++          fp_dbg ("Draining stale device data");
++          fpi_ssm_jump_to_state (ssm, OMS_INIT_DRAIN);
++          return;
++        }
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_INIT_CHIP_SN:
++      if (oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) &&
++          payload_len > 1)
++        {
++          g_autofree gchar *sn = NULL;
++
++          /* [推测] The response mirrors 0x1f: a status byte followed by the
++           * 32 byte chip serial number. */
++          sn = g_strndup ((const gchar *) &payload[1], payload_len - 1);
++          fp_info ("Chip serial: %s", sn);
++        }
++      else
++        {
++          fp_warn ("No chip serial number reported");
++        }
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_INIT_TEMPLATE_NUM:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to read the template count"));
++          return;
++        }
++
++      self->nr_templates = payload[2];
++      fp_info ("%d template(s) stored on the chip", self->nr_templates);
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_INIT_INDEX_TABLE:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to read the index table"));
++          return;
++        }
++
++      self->template_bitmap = payload[1] | (payload[2] << 8);
++      fp_info ("Template bitmap: 0x%04x", self->template_bitmap);
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_init_run_state (FpiSsm   *ssm,
++                    FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  const guint8 p_zero = 0x00;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_INIT_DRAIN:
++      oms_read (self, OMS_PACKET_SIZE, 100, FALSE, oms_init_cb);
++      break;
++
++    case OMS_INIT_CHIP_SN:
++      oms_command (self, OMS_CMD_CHIP_SN, &p_zero, 1, OMS_PACKET_SIZE, oms_init_cb);
++      break;
++
++    case OMS_INIT_TEMPLATE_NUM:
++      oms_command (self, OMS_CMD_TEMPLATE_NUM, NULL, 0, OMS_PACKET_SIZE, oms_init_cb);
++      break;
++
++    case OMS_INIT_INDEX_TABLE:
++      oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_init_cb);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++/* ------------------------------------------------------------------ *
++ * Print data helpers
++ * ------------------------------------------------------------------ */
++
++/* Templates live in 16 chip slots; the slot number is the only identity we
++ * can store, as the chip does not keep any user metadata. */
++#define OMS_NR_SLOTS 16
++
++static GVariant *
++oms_print_data_new (guint16 slot)
++{
++  return g_variant_new ("(q)", slot);
++}
++
++static gboolean
++oms_print_data_get_slot (GVariant *data,
++                         guint16  *slot)
++{
++  if (!data || !g_variant_check_format_string (data, "(q)", FALSE))
++    return FALSE;
++
++  g_variant_get (data, "(q)", slot);
++
++  return TRUE;
++}
++
++static gboolean
++oms_print_get_slot (FpPrint *print,
++                    guint16 *slot)
++{
++  g_autoptr(GVariant) data = NULL;
++
++  g_object_get (print, "fpi-data", &data, NULL);
++
++  return oms_print_data_get_slot (data, slot);
++}
++
++static FpPrint *
++oms_print_from_slot (FpiDeviceOmsMoc *self,
++                     guint16          slot)
++{
++  FpPrint *print;
++  g_autofree gchar *description = NULL;
++
++  print = fp_print_new (FP_DEVICE (self));
++
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  fpi_print_set_device_stored (print, TRUE);
++  g_object_set (print, "fpi-data", oms_print_data_new (slot), NULL);
++
++  description = g_strdup_printf ("Slot %u", slot);
++  g_object_set (print, "description", description, NULL);
++
++  return print;
++}
++
++/* ------------------------------------------------------------------ *
++ * Identify / verify
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_VERIFY_PRE_DRAIN,
++  OMS_VERIFY_START,
++  OMS_VERIFY_WAIT,
++  OMS_VERIFY_CANCEL,
++  OMS_VERIFY_DRAIN,
++  OMS_VERIFY_NUM_STATES,
++};
++
++static void
++oms_verify_cb (FpiDeviceOmsMoc *self,
++               GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_VERIFY_PRE_DRAIN:
++      /* Drop frames of a previous session before starting a new one. */
++      if (error)
++        {
++          g_error_free (error);
++          fpi_ssm_next_state (ssm);
++          break;
++        }
++
++      if (!oms_data_is_empty (self->in_data, self->in_len) &&
++          self->poll_count++ < OMS_MAX_DRAIN_READS)
++        {
++          fp_dbg ("Draining stale device data before the session");
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_PRE_DRAIN);
++          break;
++        }
++
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_VERIFY_START:
++      if (error)
++        {
++          fpi_ssm_mark_failed (ssm, error);
++          return;
++        }
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_VERIFY_WAIT:
++      if (error)
++        {
++          if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) ||
++              g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_CANCELLED))
++            {
++              self->action_error = g_steal_pointer (&error);
++              fpi_ssm_jump_to_state (ssm, OMS_VERIFY_CANCEL);
++              return;
++            }
++
++          /* No answer inside the poll window: keep polling. */
++          if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++            {
++              g_error_free (error);
++              fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++              return;
++            }
++
++          fpi_ssm_mark_failed (ssm, error);
++          return;
++        }
++
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 2)
++        {
++          /* Nothing (or nothing useful) to report yet. */
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      fp_dbg ("Identify payload: %02x %02x (%" G_GSIZE_FORMAT " bytes)",
++              payload[0], payload[1], payload_len);
++
++      if (payload[0] == OMS_ID_STATUS_OK && payload[1] == OMS_ID_RESULT_CAPTURED)
++        {
++          /* The finger image was captured; the chip reports the match
++           * result in the next frame(s). */
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_PRESENT,
++                                                   FP_FINGER_STATUS_NEEDED);
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      if (payload[0] == OMS_ID_STATUS_OK && payload[1] == OMS_ID_RESULT_MATCHED &&
++          payload_len > OMS_ID_PAYLOAD_SLOT)
++        {
++          self->matched_slot = payload[OMS_ID_PAYLOAD_SLOT];
++          self->result_received = TRUE;
++          fp_info ("Chip matched template in slot %d", self->matched_slot);
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_CANCEL);
++          return;
++        }
++
++      if (payload[0] == OMS_ID_STATUS_NOMATCH)
++        {
++          self->matched_slot = -1;
++          self->result_received = TRUE;
++          fp_dbg ("Chip found no matching template");
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_CANCEL);
++          return;
++        }
++
++      /* Still waiting for a finger. */
++      fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                               FP_FINGER_STATUS_NEEDED,
++                                               FP_FINGER_STATUS_NONE);
++      fpi_ssm_jump_to_state_delayed (ssm, OMS_VERIFY_WAIT, OMS_POLL_INTERVAL_MS);
++      break;
++
++    case OMS_VERIFY_CANCEL:
++      if (error)
++        fp_dbg ("Cancelling the session failed: %s", error->message);
++      self->poll_count = 0;
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_VERIFY_DRAIN:
++      /* The chip may still report the end of the previous session; drop
++       * those frames so that the next command starts from a clean queue. */
++      if (error)
++        {
++          fp_dbg ("Drain read failed: %s", error->message);
++          fpi_ssm_mark_completed (ssm);
++          break;
++        }
++
++      if (!oms_data_is_empty (self->in_data, self->in_len) &&
++          self->poll_count++ < OMS_MAX_DRAIN_READS)
++        {
++          fpi_ssm_jump_to_state (ssm, OMS_VERIFY_DRAIN);
++          break;
++        }
++
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_verify_run_state (FpiSsm   *ssm,
++                      FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  static const guint8 identify_params[] = { 0x05, 0xff, 0xff, 0x00, 0x00 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_VERIFY_PRE_DRAIN:
++      self->poll_count = 0;
++      oms_read (self, OMS_PACKET_SIZE, OMS_POLL_TIMEOUT_MS, FALSE, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_START:
++      fpi_device_report_finger_status_changes (device,
++                                               FP_FINGER_STATUS_NEEDED,
++                                               FP_FINGER_STATUS_NONE);
++      oms_command (self, OMS_CMD_IDENTIFY, identify_params,
++                   G_N_ELEMENTS (identify_params), 0, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_WAIT:
++      oms_read (self, OMS_POLL_SIZE, OMS_POLL_TIMEOUT_MS, TRUE, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_CANCEL:
++      fpi_device_report_finger_status_changes (device,
++                                               FP_FINGER_STATUS_NONE,
++                                               FP_FINGER_STATUS_NEEDED);
++      oms_command (self, OMS_CMD_CANCEL, NULL, 0, 0, oms_verify_cb);
++      break;
++
++    case OMS_VERIFY_DRAIN:
++      oms_read (self, OMS_PACKET_SIZE, OMS_POLL_TIMEOUT_MS, FALSE, oms_verify_cb);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_identify_ssm_done (FpiSsm   *ssm,
++                       FpDevice *device,
++                       GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *match = NULL;
++  GPtrArray *gallery = NULL;
++  guint i;
++
++  self->task_ssm = NULL;
++
++  if (self->action_error)
++    {
++      fpi_device_identify_complete (device, g_steal_pointer (&self->action_error));
++      return;
++    }
++
++  if (error)
++    {
++      fpi_device_identify_complete (device, error);
++      return;
++    }
++
++  if (self->matched_slot >= 0)
++    {
++      fpi_device_get_identify_data (device, &gallery);
++
++      for (i = 0; i < gallery->len; i++)
++        {
++          FpPrint *print = g_ptr_array_index (gallery, i);
++          guint16 slot;
++
++          if (oms_print_get_slot (print, &slot) && slot == self->matched_slot)
++            {
++              match = print;
++              break;
++            }
++        }
++
++      if (!match)
++        fp_warn ("The chip matched slot %d, which is not part of the gallery",
++                 self->matched_slot);
++    }
++
++  fpi_device_identify_report (device, match, NULL, NULL);
++  fpi_device_identify_complete (device, NULL);
++}
++
++static void
++oms_identify (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->matched_slot = -1;
++  self->result_received = FALSE;
++  self->session_retries = 0;
++  g_clear_pointer (&self->action_error, g_error_free);
++
++  self->task_ssm = fpi_ssm_new (device, oms_verify_run_state,
++                                OMS_VERIFY_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_identify_ssm_done);
++}
++
++static void
++oms_verify_ssm_done (FpiSsm   *ssm,
++                     FpDevice *device,
++                     GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *enrolled_print = NULL;
++  guint16 slot = 0;
++
++  self->task_ssm = NULL;
++
++  if (self->action_error)
++    {
++      fpi_device_verify_complete (device, g_steal_pointer (&self->action_error));
++      return;
++    }
++
++  if (error)
++    {
++      fpi_device_verify_complete (device, error);
++      return;
++    }
++
++  fpi_device_get_verify_data (device, &enrolled_print);
++
++  /* Only a match in the slot of the requested print counts as a success;
++   * the chip searches all its templates, so another enrolled finger would
++   * otherwise be reported as a match. */
++  if (self->matched_slot >= 0 && oms_print_get_slot (enrolled_print, &slot) &&
++      slot == self->matched_slot)
++    fpi_device_verify_report (device, FPI_MATCH_SUCCESS, NULL, NULL);
++  else
++    fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
++
++  fpi_device_verify_complete (device, NULL);
++}
++
++static void
++oms_verify (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *enrolled_print = NULL;
++  guint16 slot = 0;
++
++  fpi_device_get_verify_data (device, &enrolled_print);
++
++  if (!oms_print_get_slot (enrolled_print, &slot))
++    {
++      fpi_device_verify_complete (device,
++                                  fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
++      return;
++    }
++
++  self->matched_slot = -1;
++  self->result_received = FALSE;
++  self->session_retries = 0;
++  g_clear_pointer (&self->action_error, g_error_free);
++
++  self->task_ssm = fpi_ssm_new (device, oms_verify_run_state,
++                                OMS_VERIFY_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_verify_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Enrollment
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_ENROLL_CAPTURE,
++  OMS_ENROLL_CAPTURE_POLL,
++  OMS_ENROLL_SLOT,
++  OMS_ENROLL_BUILD,
++  OMS_ENROLL_PROGRESS,
++  OMS_ENROLL_CONFIRM_NUM,
++  OMS_ENROLL_CONFIRM_TABLE,
++  OMS_ENROLL_CANCEL,
++  OMS_ENROLL_NUM_STATES,
++};
++
++static gboolean
++oms_find_free_slot (FpiDeviceOmsMoc *self,
++                    guint8          *slot)
++{
++  guint i;
++
++  for (i = 0; i < OMS_NR_SLOTS; i++)
++    {
++      if (!(self->template_bitmap & (1 << i)))
++        {
++          *slot = i;
++          return TRUE;
++        }
++    }
++
++  return FALSE;
++}
++
++static void
++oms_enroll_ssm_done (FpiSsm   *ssm,
++                     FpDevice *device,
++                     GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *print = NULL;
++
++  self->task_ssm = NULL;
++
++  fpi_device_report_finger_status_changes (device,
++                                           FP_FINGER_STATUS_NONE,
++                                           FP_FINGER_STATUS_PRESENT |
++                                           FP_FINGER_STATUS_NEEDED);
++
++  if (self->action_error)
++    {
++      fpi_device_enroll_complete (device, NULL, g_steal_pointer (&self->action_error));
++      return;
++    }
++
++  if (error)
++    {
++      fpi_device_enroll_complete (device, NULL, error);
++      return;
++    }
++
++  fpi_device_get_enroll_data (device, &print);
++  fp_dbg ("Enroll done for slot %u, print %p", self->enroll_slot, print);
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  fpi_print_set_device_stored (print, TRUE);
++  g_object_set (print, "fpi-data", oms_print_data_new (self->enroll_slot), NULL);
++
++  fp_info ("Enrollment complete, template stored in slot %u", self->enroll_slot);
++
++  fpi_device_enroll_complete (device, g_object_ref (print), NULL);
++  fp_dbg ("Enrollment completion reported");
++}
++
++static void
++oms_enroll_cb (FpiDeviceOmsMoc *self,
++               GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++  guint8 status, result;
++
++  if (error)
++    {
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) ||
++          g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_CANCELLED))
++        {
++          self->action_error = g_steal_pointer (&error);
++          fpi_ssm_jump_to_state (ssm, OMS_ENROLL_CANCEL);
++          return;
++        }
++
++      if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          g_error_free (error);
++          error = NULL;
++        }
++      else
++        {
++          fpi_ssm_mark_failed (ssm, error);
++          return;
++        }
++    }
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_ENROLL_CAPTURE:
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_CAPTURE_POLL:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 2)
++        {
++          if (self->poll_count++ > OMS_MAX_CAPTURE_POLLS)
++            {
++              fpi_ssm_mark_failed (ssm,
++                                   fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++              return;
++            }
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE_POLL, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      status = payload[0];
++      result = payload[1];
++
++      if (status == OMS_ID_STATUS_OK && result == OMS_ID_RESULT_CAPTURED)
++        {
++          fp_dbg ("Finger captured, waiting for the search result");
++          self->captured = TRUE;
++          self->poll_count = 0;
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_PRESENT,
++                                                   FP_FINGER_STATUS_NEEDED);
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE_POLL, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      /* The chip always searches its templates first: a match means that
++       * this finger is already enrolled and must not be added again. */
++      if (status == OMS_ID_STATUS_OK && result == OMS_ID_RESULT_MATCHED &&
++          payload_len > OMS_ID_PAYLOAD_SLOT)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_DUPLICATE,
++                                                         "Finger is already enrolled in slot %u",
++                                                         payload[OMS_ID_PAYLOAD_SLOT]));
++          return;
++        }
++
++      if (status == OMS_ID_STATUS_NOMATCH)
++        {
++          if (!self->captured)
++            {
++              /* The chip gave up without an image, ask for another press. */
++              if (self->capture_retries++ < OMS_MAX_SESSION_RETRY)
++                {
++                  fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE, OMS_POLL_INTERVAL_MS);
++                  return;
++                }
++
++              fpi_ssm_mark_failed (ssm,
++                                   fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
++              return;
++            }
++
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      /* Not ready yet, or still capturing. */
++      if (self->captured && self->poll_count++ > OMS_MAX_CAPTURE_END_POLLS)
++        {
++          fp_dbg ("No capture result notification, continuing anyway");
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_CAPTURE_POLL, OMS_POLL_INTERVAL_MS);
++      break;
++
++    case OMS_ENROLL_SLOT:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to read the index table"));
++          return;
++        }
++
++      self->template_bitmap = payload[1] | (payload[2] << 8);
++
++      if (!oms_find_free_slot (self, &self->enroll_slot))
++        {
++          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL));
++          return;
++        }
++
++      fp_info ("Enrolling into slot %u", self->enroll_slot);
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_BUILD:
++      self->enroll_level = 0;
++      self->poll_count = 0;
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_PROGRESS:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          if (self->poll_count++ > OMS_MAX_ENROLL_POLLS)
++            {
++              fpi_ssm_mark_failed (ssm,
++                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                             "Enrollment timed out"));
++              return;
++            }
++          fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_PROGRESS, OMS_POLL_INTERVAL_MS);
++          return;
++        }
++
++      fp_dbg ("Enroll progress: %02x %02x %02x", payload[0], payload[1], payload[2]);
++
++      if (payload[1] >= 1 && payload[1] <= 3 &&
++          payload[2] >= 1 && payload[2] <= OMS_ENROLL_STAGES &&
++          payload[2] > self->enroll_level)
++        {
++          self->enroll_level = payload[2];
++          fpi_device_enroll_progress (FP_DEVICE (self), self->enroll_level, NULL, NULL);
++
++          /* Each level needs a new finger press, ask for the next one. */
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_NEEDED,
++                                                   FP_FINGER_STATUS_PRESENT);
++        }
++      else
++        {
++          fpi_device_report_finger_status_changes (FP_DEVICE (self),
++                                                   FP_FINGER_STATUS_PRESENT,
++                                                   FP_FINGER_STATUS_NONE);
++        }
++
++      if (payload[1] == OMS_ENROLL_TRAILER_INDEX)
++        {
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++
++      fpi_ssm_jump_to_state_delayed (ssm, OMS_ENROLL_PROGRESS, OMS_POLL_INTERVAL_MS);
++      break;
++
++    case OMS_ENROLL_CONFIRM_NUM:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to verify the enrollment"));
++          return;
++        }
++
++      self->nr_templates = payload[2];
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OMS_ENROLL_CONFIRM_TABLE:
++      if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++          payload_len < 3)
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Failed to verify the enrollment"));
++          return;
++        }
++
++      self->template_bitmap = payload[1] | (payload[2] << 8);
++
++      if (!(self->template_bitmap & (1 << self->enroll_slot)))
++        {
++          fpi_ssm_mark_failed (ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "The chip did not store the template"));
++          return;
++        }
++
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    case OMS_ENROLL_CANCEL:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_enroll_run_state (FpiSsm   *ssm,
++                      FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  static const guint8 identify_params[] = { 0x05, 0xff, 0xff, 0x00, 0x00 };
++  const guint8 p_zero = 0x00;
++  guint8 build_params[] = { 0x00, 0x00, OMS_ENROLL_STAGES, 0x00, 0x00 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_ENROLL_CAPTURE:
++      self->poll_count = 0;
++      fpi_device_report_finger_status_changes (device,
++                                               FP_FINGER_STATUS_NEEDED,
++                                               FP_FINGER_STATUS_NONE);
++      oms_command (self, OMS_CMD_IDENTIFY, identify_params,
++                   G_N_ELEMENTS (identify_params), 0, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CAPTURE_POLL:
++      oms_read (self, OMS_POLL_SIZE, OMS_POLL_TIMEOUT_MS, TRUE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_SLOT:
++      oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_BUILD:
++      build_params[1] = self->enroll_slot;
++      oms_command (self, OMS_CMD_ENROLL, build_params,
++                   G_N_ELEMENTS (build_params), 0, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_PROGRESS:
++      oms_read (self, OMS_POLL_SIZE, OMS_POLL_TIMEOUT_MS, TRUE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CONFIRM_NUM:
++      oms_command (self, OMS_CMD_TEMPLATE_NUM, NULL, 0, OMS_PACKET_SIZE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CONFIRM_TABLE:
++      oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_enroll_cb);
++      break;
++
++    case OMS_ENROLL_CANCEL:
++      oms_command (self, OMS_CMD_CANCEL, NULL, 0, 0, oms_enroll_cb);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_enroll (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->captured = FALSE;
++  self->enroll_slot = 0;
++  self->enroll_level = 0;
++  self->capture_retries = 0;
++  g_clear_pointer (&self->action_error, g_error_free);
++
++  self->task_ssm = fpi_ssm_new (device, oms_enroll_run_state, OMS_ENROLL_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_enroll_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Delete / list
++ * ------------------------------------------------------------------ */
++
++enum {
++  OMS_DELETE_SEND,
++  OMS_DELETE_COMPLETE,
++  OMS_DELETE_NUM_STATES,
++};
++
++static void
++oms_delete_cb (FpiDeviceOmsMoc *self,
++               GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++  const guint8 *payload;
++  gsize payload_len;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (fpi_ssm_get_cur_state (ssm) == OMS_DELETE_SEND)
++    {
++      if (oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len))
++        fp_dbg ("Delete response: %02x", payload[0]);
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  fpi_ssm_mark_completed (ssm);
++}
++
++static void
++oms_delete_run_state (FpiSsm   *ssm,
++                      FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  guint8 params[] = { 0x00, 0x00, 0x00, 0x01 };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_DELETE_SEND:
++      params[1] = self->enroll_slot;
++      fp_info ("Deleting template in slot %u", self->enroll_slot);
++      oms_command (self, OMS_CMD_TEMPLATE_OP, params, G_N_ELEMENTS (params),
++                   OMS_PACKET_SIZE, oms_delete_cb);
++      break;
++
++    case OMS_DELETE_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_delete_ssm_done (FpiSsm   *ssm,
++                     FpDevice *device,
++                     GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++  fpi_device_delete_complete (device, error);
++}
++
++static void
++oms_delete (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  FpPrint *print = NULL;
++  g_autoptr(GVariant) data = NULL;
++  guint16 slot;
++
++  fpi_device_get_delete_data (device, &print);
++  g_object_get (print, "fpi-data", &data, NULL);
++
++  if (!oms_print_data_get_slot (data, &slot))
++    {
++      fpi_device_delete_complete (device,
++                                  fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
++      return;
++    }
++
++  self->enroll_slot = slot;
++  self->task_ssm = fpi_ssm_new (device, oms_delete_run_state, OMS_DELETE_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_delete_ssm_done);
++}
++
++enum {
++  OMS_CLEAR_SEND,
++  OMS_CLEAR_COMPLETE,
++  OMS_CLEAR_NUM_STATES,
++};
++
++static void
++oms_clear_cb (FpiDeviceOmsMoc *self,
++              GError          *error)
++{
++  FpiSsm *ssm = self->task_ssm;
++
++  if (error)
++    {
++      fpi_ssm_mark_failed (ssm, error);
++      return;
++    }
++
++  if (fpi_ssm_get_cur_state (ssm) == OMS_CLEAR_SEND)
++    {
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  fpi_ssm_mark_completed (ssm);
++}
++
++static void
++oms_clear_run_state (FpiSsm   *ssm,
++                     FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  static const guint8 params[] = { 0x00, 0x00, 0x00, 0x1e };
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OMS_CLEAR_SEND:
++      fp_info ("Clearing the template storage");
++      oms_command (self, OMS_CMD_TEMPLATE_OP, params, G_N_ELEMENTS (params),
++                   OMS_PACKET_SIZE, oms_clear_cb);
++      break;
++
++    case OMS_CLEAR_COMPLETE:
++      fpi_ssm_mark_completed (ssm);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++oms_clear_ssm_done (FpiSsm   *ssm,
++                    FpDevice *device,
++                    GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++
++  if (!error)
++    {
++      self->template_bitmap = 0;
++      self->nr_templates = 0;
++    }
++
++  fpi_device_clear_storage_complete (device, error);
++}
++
++static void
++oms_clear_storage (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = fpi_ssm_new (device, oms_clear_run_state, OMS_CLEAR_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_clear_ssm_done);
++}
++
++static void
++oms_list_cb (FpiDeviceOmsMoc *self,
++             GError          *error)
++{
++  const guint8 *payload;
++  gsize payload_len;
++  g_autoptr(GPtrArray) gallery = NULL;
++  guint i;
++
++  if (error)
++    {
++      fpi_device_list_complete (FP_DEVICE (self), NULL, error);
++      self->task_ssm = NULL;
++      return;
++    }
++
++  if (!oms_parse_frame (self->in_data, self->in_len, &payload, &payload_len) ||
++      payload_len < 3)
++    {
++      fpi_device_list_complete (FP_DEVICE (self), NULL,
++                                fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                          "Failed to read the index table"));
++      self->task_ssm = NULL;
++      return;
++    }
++
++  self->template_bitmap = payload[1] | (payload[2] << 8);
++  self->nr_templates = 0;
++
++  gallery = g_ptr_array_new_with_free_func (g_object_unref);
++
++  for (i = 0; i < OMS_NR_SLOTS; i++)
++    {
++      if (self->template_bitmap & (1 << i))
++        {
++          self->nr_templates++;
++          g_ptr_array_add (gallery, g_object_ref_sink (oms_print_from_slot (self, i)));
++        }
++    }
++
++  fp_info ("%u template(s) in the chip storage", self->nr_templates);
++
++  self->task_ssm = NULL;
++  fpi_device_list_complete (FP_DEVICE (self), g_steal_pointer (&gallery), NULL);
++}
++
++static void
++oms_list_run_state (FpiSsm   *ssm,
++                    FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  const guint8 p_zero = 0x00;
++
++  oms_command (self, OMS_CMD_INDEX_TABLE, &p_zero, 1, OMS_PACKET_SIZE, oms_list_cb);
++}
++
++static void
++oms_list_ssm_done (FpiSsm   *ssm,
++                   FpDevice *device,
++                   GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++
++  if (error)
++    fpi_device_list_complete (device, NULL, error);
++}
++
++static void
++oms_list (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = fpi_ssm_new (device, oms_list_run_state, 1);
++  fpi_ssm_start (self->task_ssm, oms_list_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * Device lifecycle
++ * ------------------------------------------------------------------ */
++
++static void
++oms_probe (FpDevice *device)
++{
++  g_autoptr(GError) error = NULL;
++  g_autofree gchar *serial = NULL;
++  GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
++
++  if (!g_usb_device_open (usb_dev, &error))
++    {
++      fpi_device_probe_complete (device, NULL, NULL, g_steal_pointer (&error));
++      return;
++    }
++
++  if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
++    {
++      g_usb_device_close (usb_dev, NULL);
++      fpi_device_probe_complete (device, NULL, NULL, g_steal_pointer (&error));
++      return;
++    }
++
++  serial = g_usb_device_get_string_descriptor (
++    usb_dev, g_usb_device_get_serial_number_index (usb_dev), &error);
++  g_usb_device_release_interface (usb_dev, 0, 0, NULL);
++  g_usb_device_close (usb_dev, NULL);
++
++  if (serial)
++    fp_info ("Device serial: %s", serial);
++
++  fpi_device_probe_complete (device, serial, NULL, NULL);
++}
++
++static void
++oms_init_ssm_done (FpiSsm   *ssm,
++                   FpDevice *device,
++                   GError   *error)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  self->task_ssm = NULL;
++  fpi_device_open_complete (device, error);
++}
++
++static void
++oms_open (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++  g_autoptr(GError) error = NULL;
++  GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
++
++  if (!g_usb_device_claim_interface (usb_dev, 0, 0, &error))
++    {
++      fpi_device_open_complete (device, g_steal_pointer (&error));
++      return;
++    }
++
++  fpi_device_set_nr_enroll_stages (device, OMS_ENROLL_STAGES);
++
++  self->read_retries = 0;
++  self->task_ssm = fpi_ssm_new (device, oms_init_run_state, OMS_INIT_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, oms_init_ssm_done);
++}
++
++static void
++oms_close_ssm_done (FpiSsm   *ssm,
++                    FpDevice *device,
++                    GError   *error)
++{
++  GUsbDevice *usb_dev = fpi_device_get_usb_device (device);
++  g_autoptr(GError) release_error = NULL;
++
++  g_usb_device_release_interface (usb_dev, 0, 0, &release_error);
++
++  if (error == NULL)
++    error = g_steal_pointer (&release_error);
++
++  fpi_device_close_complete (device, error);
++}
++
++static void
++oms_close_cb (FpiDeviceOmsMoc *self,
++              GError          *error)
++{
++  if (error)
++    fp_dbg ("Cancelling the session failed: %s", error->message);
++
++  fpi_ssm_mark_completed (self->task_ssm);
++}
++
++static void
++oms_close_run_state (FpiSsm   *ssm,
++                     FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  oms_command (self, OMS_CMD_CANCEL, NULL, 0, 0, oms_close_cb);
++}
++
++static void
++oms_close (FpDevice *device)
++{
++  FpiDeviceOmsMoc *self = FPI_DEVICE_OMS_MOC (device);
++
++  g_clear_error (&self->action_error);
++
++  self->task_ssm = fpi_ssm_new (device, oms_close_run_state, 1);
++  fpi_ssm_start (self->task_ssm, oms_close_ssm_done);
++}
++
++/* ------------------------------------------------------------------ *
++ * GObject boilerplate
++ * ------------------------------------------------------------------ */
++
++static const FpIdEntry id_table[] = {
++  { .vid = OMS_VENDOR_ID, .pid = OMS_PRODUCT_ID },
++  { .vid = 0, .pid = 0, .driver_data = 0 },     /* terminating entry */
++};
++
++static void
++fpi_device_omsmoc_init (FpiDeviceOmsMoc *self)
++{
++}
++
++static void
++fpi_device_omsmoc_class_init (FpiDeviceOmsMocClass *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++
++  dev_class->id = FP_COMPONENT;
++  dev_class->full_name = "OMS Match-on-Chip Fingerprint Sensor";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  dev_class->id_table = id_table;
++  dev_class->nr_enroll_stages = OMS_ENROLL_STAGES;
++  dev_class->temp_hot_seconds = -1;
++
++  dev_class->probe = oms_probe;
++  dev_class->open = oms_open;
++  dev_class->close = oms_close;
++  dev_class->enroll = oms_enroll;
++  dev_class->identify = oms_identify;
++  dev_class->verify = oms_verify;
++  dev_class->list = oms_list;
++  dev_class->delete = oms_delete;
++  dev_class->clear_storage = oms_clear_storage;
++
++  fpi_device_class_auto_initialize_features (dev_class);
++
++  /* The chip searches all its templates before an enrollment, so an
++   * already enrolled finger can be detected. */
++  dev_class->features |= FP_DEVICE_FEATURE_DUPLICATES_CHECK;
++}
+diff --git a/libfprint/drivers/omsmoc/omsmoc.h b/libfprint/drivers/omsmoc/omsmoc.h
+new file mode 100644
+index 0000000..92bd5a8
+--- /dev/null
++++ b/libfprint/drivers/omsmoc/omsmoc.h
+@@ -0,0 +1,25 @@
++/*
++ * OMS Match-on-Chip driver for libfprint
++ * Copyright (C) 2026 The OMS Linux driver contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include "fpi-device.h"
++#include "fpi-ssm.h"
++
++G_DECLARE_FINAL_TYPE (FpiDeviceOmsMoc, fpi_device_omsmoc, FPI, DEVICE_OMS_MOC, FpDevice)
+diff --git a/libfprint/drivers/omsmoc/omsmoc_proto.c b/libfprint/drivers/omsmoc/omsmoc_proto.c
+new file mode 100644
+index 0000000..e806c42
+--- /dev/null
++++ b/libfprint/drivers/omsmoc/omsmoc_proto.c
+@@ -0,0 +1,127 @@
++/*
++ * OMS match-on-chip 协议编解码（EF01 帧）
++ *
++ * 纯字节操作，独立于 libfprint 私有的设备状态机；见 omsmoc_proto.h。
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include "omsmoc_proto.h"
++
++#ifdef OMS_PROTO_STANDALONE
++#define OMS_WARN(...) g_warning (__VA_ARGS__)
++#else
++#include "fpi-log.h"
++#define OMS_WARN(...) fp_warn (__VA_ARGS__)
++#endif
++
++/* 校验范围：从类型字节（偏移 6）到负载末尾，累加后取低 16 位。 */
++static guint16
++oms_checksum (const guint8 *buf,
++              gsize         start,
++              gsize         end)
++{
++  guint16 checksum = 0;
++  gsize i;
++
++  for (i = start; i < end; i++)
++    checksum += buf[i];
++
++  return checksum;
++}
++
++gsize
++oms_build_frame (guint8        *buf,
++                 guint8         cmd,
++                 const guint8  *params,
++                 gsize          params_len)
++{
++  gsize len;
++  guint16 checksum;
++
++  g_return_val_if_fail (params_len <= OMS_MAX_PARAM_SIZE, 0);
++
++  len = 1 + params_len + OMS_FRAME_TRAILER_SIZE;
++
++  memset (buf, 0x00, OMS_PACKET_SIZE);
++  buf[0] = 0xef;
++  buf[1] = 0x01;
++  buf[2] = 0xff;
++  buf[3] = 0xff;
++  buf[4] = 0xff;
++  buf[5] = 0xff;
++  buf[6] = OMS_FRAME_KIND_REQUEST;
++  buf[7] = 0x00;
++  buf[8] = len;
++  buf[9] = cmd;
++  if (params_len > 0)
++    memcpy (&buf[10], params, params_len);
++
++  checksum = oms_checksum (buf, 6,
++                           OMS_FRAME_HEADER_SIZE + len - OMS_FRAME_TRAILER_SIZE);
++
++  buf[OMS_FRAME_HEADER_SIZE + len - 2] = (checksum >> 8) & 0xff;
++  buf[OMS_FRAME_HEADER_SIZE + len - 1] = checksum & 0xff;
++
++  return OMS_FRAME_HEADER_SIZE + len;
++}
++
++gboolean
++oms_parse_frame (const guint8  *buf,
++                 gsize          buf_len,
++                 const guint8 **payload,
++                 gsize         *payload_len)
++{
++  gsize frame_len;
++  guint16 checksum;
++  guint16 expected;
++
++  if (buf_len < OMS_FRAME_HEADER_SIZE)
++    return FALSE;
++
++  if (buf[0] != 0xef || buf[1] != 0x01 || buf[2] != 0xff || buf[3] != 0xff ||
++      buf[4] != 0xff || buf[5] != 0xff || buf[6] != OMS_FRAME_KIND_RESPONSE)
++    return FALSE;
++
++  frame_len = buf[8];
++  if (frame_len < OMS_FRAME_TRAILER_SIZE ||
++      OMS_FRAME_HEADER_SIZE + frame_len > buf_len)
++    return FALSE;
++
++  checksum = oms_checksum (buf, 6,
++                           OMS_FRAME_HEADER_SIZE + frame_len - OMS_FRAME_TRAILER_SIZE);
++
++  expected = (buf[OMS_FRAME_HEADER_SIZE + frame_len - 2] << 8) |
++             buf[OMS_FRAME_HEADER_SIZE + frame_len - 1];
++  if (checksum != expected)
++    {
++      OMS_WARN ("Response frame checksum mismatch (0x%04x != 0x%04x)",
++                checksum, expected);
++      return FALSE;
++    }
++
++  *payload = &buf[OMS_FRAME_HEADER_SIZE];
++  *payload_len = frame_len - OMS_FRAME_TRAILER_SIZE;
++
++  return TRUE;
++}
++
++/* The device pads its answers to the requested window size and reports
++ * "nothing to say" with an all zero packet. */
++gboolean
++oms_data_is_empty (const guint8 *data,
++                   gsize         len)
++{
++  gsize i;
++
++  for (i = 0; i < len; i++)
++    {
++      if (data[i] != 0x00)
++        return FALSE;
++    }
++
++  return TRUE;
++}
+diff --git a/libfprint/drivers/omsmoc/omsmoc_proto.h b/libfprint/drivers/omsmoc/omsmoc_proto.h
+new file mode 100644
+index 0000000..b3f7cd6
+--- /dev/null
++++ b/libfprint/drivers/omsmoc/omsmoc_proto.h
+@@ -0,0 +1,46 @@
++/*
++ * OMS match-on-chip 协议编解码（EF01 帧）
++ *
++ * 这些函数是纯函数：只做字节操作，不接触设备状态，因此可以脱离硬件和
++ * libfprint 私有头文件单独做单元测试（见 tests/test-omsmoc-proto.c）。
++ *
++ * 本文件同时被驱动（omsmoc.c）和测试使用。
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef OMSMOC_PROTO_H
++#define OMSMOC_PROTO_H
++
++#include <glib.h>
++
++/* 一次 USB 批量传输的固定包长（设备按 64 字节窗口应答） */
++#define OMS_PACKET_SIZE 64
++
++/* EF01 帧布局：9 字节头 + 负载 + 2 字节校验和 */
++#define OMS_FRAME_HEADER_SIZE   9
++#define OMS_FRAME_TRAILER_SIZE  2
++#define OMS_FRAME_KIND_REQUEST  0x01
++#define OMS_FRAME_KIND_RESPONSE 0x07
++#define OMS_MAX_PARAM_SIZE      (OMS_PACKET_SIZE - OMS_FRAME_HEADER_SIZE - 1 - OMS_FRAME_TRAILER_SIZE)
++
++/* 构造一个请求帧，返回写入的总字节数；参数过长时返回 0。 */
++gsize    oms_build_frame (guint8        *buf,
++                          guint8         cmd,
++                          const guint8  *params,
++                          gsize          params_len);
++
++/* 解析一个应答帧；成功时 payload 指向负载起点（不含头/尾）。 */
++gboolean oms_parse_frame (const guint8  *buf,
++                          gsize          buf_len,
++                          const guint8 **payload,
++                          gsize         *payload_len);
++
++/* 全零包表示“设备无话可说”（设备会把应答补齐到窗口长度）。 */
++gboolean oms_data_is_empty (const guint8 *data,
++                            gsize         len);
++
++#endif /* OMSMOC_PROTO_H */
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533c..82b5100 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -134,6 +134,10 @@ driver_sources = {
+         'drivers/goodixmoc/goodix.c',
+         'drivers/goodixmoc/goodix_proto.c',
+     ),
++    'omsmoc' : files(
++        'drivers/omsmoc/omsmoc.c',
++        'drivers/omsmoc/omsmoc_proto.c',
++    ),
+     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
+     'realtek' : files('drivers/realtek/realtek.c'),
+     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
+diff --git a/meson.build b/meson.build
+index ab09dc1..f6c736e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -141,6 +141,7 @@ drivers_info = {
+     'upeksonly': {},
+     'upekts': {},
+     'goodixmoc': {},
++    'omsmoc': {},
+     'nb1010': {},
+     'fpcmoc': {},
+     'realtek': {},
+diff --git a/tests/meson.build b/tests/meson.build
+index aad0675..39a82d5 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -62,6 +62,7 @@ drivers_tests = {
+     'focaltech_moc': { 'timeout': 30 },
+     'focaltech_moc-6553': {},
+     'mafpmoc': {},
++    'omsmoc': { 'timeout': 30 },
+     'secugen': {},
+ }
+ 
+@@ -468,3 +469,21 @@ if valgrind.found() and libfprint_sanitizers.length() == 0
+             'LIBFPRINT_TEST_WRAPPER=' + ' '.join(libfprint_wrapper),
+         ])
+ endif
++
++# Frame codec of the omsmoc driver.  The codec is a pure byte-level helper, so
++# it is compiled straight into the test binary and needs no hardware.
++omsmoc_proto_test = executable('test-omsmoc-proto',
++    sources: [
++        'test-omsmoc-proto.c',
++        '../libfprint/drivers/omsmoc/omsmoc_proto.c',
++    ],
++    include_directories: include_directories('../libfprint/drivers/omsmoc'),
++    dependencies: [libfprint_private_dep],
++    c_args: common_cflags,
++)
++
++test('omsmoc-proto',
++    omsmoc_proto_test,
++    suite: ['unit-tests'],
++    env: envs,
++)
+diff --git a/tests/omsmoc/custom.pcapng b/tests/omsmoc/custom.pcapng
+new file mode 100644
+index 0000000..c217a58
+Binary files /dev/null and b/tests/omsmoc/custom.pcapng differ
+diff --git a/tests/omsmoc/custom.py b/tests/omsmoc/custom.py
+new file mode 100644
+index 0000000..1ce06e4
+--- /dev/null
++++ b/tests/omsmoc/custom.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++#
++# omsmoc (OMS Match-on-Chip) umockdev test
++# Copyright (C) 2026 The OMS Linux driver contributors
++#
++# This library is free software; you can redistribute it and/or
++# modify it under the terms of the GNU Lesser General Public
++# License as published by the Free Software Foundation; either
++# version 2.1 of the License, or (at your option) any later version.
++#
++# This test is run against the real hardware while recording (see
++# tests/create-driver-test.py) and against the recorded USB traffic
++# afterwards.  Everything here is read-only with respect to the chip
++# storage, so recording the test never modifies an enrolled template.
++
++import sys
++import traceback
++
++import gi
++
++gi.require_version('FPrint', '2.0')
++from gi.repository import FPrint, GLib
++
++# Exit with error on any exception, including those happening in async callbacks
++sys.excepthook = lambda *args: (traceback.print_exception(*args), sys.exit(1))
++
++ctx = GLib.main_context_default()
++
++c = FPrint.Context()
++c.enumerate()
++devices = c.get_devices()
++
++assert len(devices) == 1, 'Expected exactly one supported device'
++d = devices[0]
++del devices
++
++assert d.get_driver() == 'omsmoc'
++assert not d.has_feature(FPrint.DeviceFeature.CAPTURE)
++assert d.has_feature(FPrint.DeviceFeature.IDENTIFY)
++assert d.has_feature(FPrint.DeviceFeature.VERIFY)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_LIST)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_DELETE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_CLEAR)
++assert d.get_scan_type() == FPrint.ScanType.PRESS
++assert d.get_nr_enroll_stages() == 6
++
++d.open_sync()
++
++# The chip storage is only read here: listing the templates reads the
++# index table (0x1f) and reports one print per occupied slot.
++print('listing templates')
++stored = d.list_prints_sync()
++print('device reports %d template(s)' % len(stored))
++assert len(stored) > 0, 'No template enrolled on the chip'
++
++def verify_with_retries(fp_print, attempts=3):
++    for attempt in range(attempts):
++        print('verifying, press the finger for %s (attempt %d/%d)'
++              % (fp_print.get_description(), attempt + 1, attempts))
++        res, _print = d.verify_sync(fp_print)
++        if res:
++            return True
++        print('the chip did not match the finger, try again')
++
++    return False
++
++
++# Verification of the first stored print.  The chip reports the slot it
++# matched, and the driver only reports a match if that slot is the one of
++# the requested print.
++assert verify_with_retries(stored[0]), 'The enrolled finger was not recognised'
++print('verify matched')
++
++# Identification reports the print whose slot the chip matched.
++identified = {'done': False, 'match': None}
++
++
++def identify_done(dev, res):
++    try:
++        match, _print = dev.identify_finish(res)
++        identified['match'] = match
++    except GLib.Error as err:
++        identified['error'] = err.message
++    finally:
++        identified['done'] = True
++
++
++for attempt in range(3):
++    identified.update({'done': False, 'match': None})
++    print('identifying, press an enrolled finger again (attempt %d/3)' % (attempt + 1))
++    d.identify(stored, callback=identify_done)
++    while not identified['done']:
++        ctx.iteration(True)
++
++    assert 'error' not in identified, identified.get('error')
++    if identified['match'] is not None:
++        break
++
++assert identified['match'] is not None, 'No match reported'
++print('identify matched')
++
++d.close_sync()
++
++del d
++del c
++del stored
+diff --git a/tests/omsmoc/device b/tests/omsmoc/device
+new file mode 100644
+index 0000000..6a283f3
+--- /dev/null
++++ b/tests/omsmoc/device
+@@ -0,0 +1,332 @@
++P: /devices/pci0000:00/0000:00:08.1/0000:63:00.3/usb1/1-4
++N: bus/usb/001/008=1201000200000040A733882300020102030109022000010100A0FA0904000002DCA0B0000705810240000007050102400000
++E: BUSNUM=001
++E: CURRENT_TAGS=:seat:uaccess:
++E: DEVNAME=/dev/bus/usb/001/008
++E: DEVNUM=008
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_63_00_3-usb-0_4
++E: ID_INTEGRATION=internal
++E: ID_MODEL=fingerprint_module
++E: ID_MODEL_ENC=fingerprint\x20module
++E: ID_MODEL_ID=2388
++E: ID_PATH=pci-0000:63:00.3-usb-0:4
++E: ID_PATH_TAG=pci-0000_63_00_3-usb-0_4
++E: ID_PATH_WITH_USB_REVISION=pci-0000:63:00.3-usbv2-0:4
++E: ID_PERSIST=0
++E: ID_REVISION=0200
++E: ID_SERIAL=Jiangxi_OMS_Microelectronics_Co._Ltd._fingerprint_module_oms-test-dev000
++E: ID_SERIAL_SHORT=oms-test-dev000
++E: ID_USB_INTERFACES=:dca0b0:
++E: ID_USB_MODEL=fingerprint_module
++E: ID_USB_MODEL_ENC=fingerprint\x20module
++E: ID_USB_MODEL_ID=2388
++E: ID_USB_REVISION=0200
++E: ID_USB_SERIAL=Jiangxi_OMS_Microelectronics_Co._Ltd._fingerprint_module_oms-test-dev000
++E: ID_USB_SERIAL_SHORT=oms-test-dev000
++E: ID_USB_VENDOR=Jiangxi_OMS_Microelectronics_Co._Ltd.
++E: ID_USB_VENDOR_ENC=Jiangxi\x20OMS\x20Microelectronics\x20Co.\x2cLtd.
++E: ID_USB_VENDOR_ID=33a7
++E: ID_VENDOR=Jiangxi_OMS_Microelectronics_Co._Ltd.
++E: ID_VENDOR_ENC=Jiangxi\x20OMS\x20Microelectronics\x20Co.\x2cLtd.
++E: ID_VENDOR_ID=33a7
++E: MAJOR=189
++E: MINOR=7
++E: PRODUCT=33a7/2388/200
++E: SUBSYSTEM=usb
++E: TAGS=:seat:uaccess:
++E: TYPE=0/0/0
++A: authorized=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=00\n
++A: bDeviceProtocol=00\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=500mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0200\n
++A: bmAttributes=a0\n
++A: busnum=1\n
++A: configuration=
++H: descriptors=1201000200000040A733882300020102030109022000010100A0FA0904000002DCA0B0000705810240000007050102400000
++A: dev=189:7\n
++A: devnum=8\n
++A: devpath=4\n
++L: driver=../../../../../../bus/usb/drivers/usb
++L: firmware_node=../../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17/device:23/device:24/device:28
++A: idProduct=2388\n
++A: idVendor=33a7\n
++A: ltm_capable=no\n
++A: manufacturer=Jiangxi OMS Microelectronics Co.,Ltd.\n
++A: maxchild=0\n
++A: physical_location/dock=no\n
++A: physical_location/horizontal_position=center\n
++A: physical_location/lid=no\n
++A: physical_location/panel=left\n
++A: physical_location/vertical_position=center\n
++L: port=../1-0:1.0/usb1-port4
++A: power/active_duration=3566314\n
++A: power/autosuspend=2\n
++A: power/autosuspend_delay_ms=2000\n
++A: power/connected_duration=3566314\n
++A: power/control=on\n
++A: power/level=on\n
++A: power/persist=0\n
++A: power/runtime_active_time=3566067\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=fingerprint module\n
++A: quirks=0x0\n
++A: removable=fixed\n
++A: rx_lanes=1\n
++A: serial=oms-test-dev00000
++A: speed=12\n
++A: tx_lanes=1\n
++A: urbnum=32511\n
++A: version= 2.00\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:63:00.3/usb1
++N: bus/usb/001/001=12010002090001406B1D020002070302010109021900010100E0000904000001090000000705810304000C
++E: BUSNUM=001
++E: CURRENT_TAGS=:seat:
++E: DEVNAME=/dev/bus/usb/001/001
++E: DEVNUM=001
++E: DEVTYPE=usb_device
++E: DRIVER=usb
++E: ID_AUTOSUSPEND=1
++E: ID_BUS=usb
++E: ID_FOR_SEAT=usb-pci-0000_63_00_3
++E: ID_MODEL=xHCI_Host_Controller
++E: ID_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_MODEL_FROM_DATABASE=2.0 root hub
++E: ID_MODEL_ID=0002
++E: ID_PATH=pci-0000:63:00.3
++E: ID_PATH_TAG=pci-0000_63_00_3
++E: ID_REVISION=0702
++E: ID_SERIAL=Linux_7.2.4-arch1-2_xhci-hcd_xHCI_Host_Controller_0000:63:00.3
++E: ID_SERIAL_SHORT=0000:63:00.3
++E: ID_USB_INTERFACES=:090000:
++E: ID_USB_MODEL=xHCI_Host_Controller
++E: ID_USB_MODEL_ENC=xHCI\x20Host\x20Controller
++E: ID_USB_MODEL_ID=0002
++E: ID_USB_REVISION=0702
++E: ID_USB_SERIAL=Linux_7.2.4-arch1-2_xhci-hcd_xHCI_Host_Controller_0000:63:00.3
++E: ID_USB_SERIAL_SHORT=0000:63:00.3
++E: ID_USB_VENDOR=Linux_7.2.4-arch1-2_xhci-hcd
++E: ID_USB_VENDOR_ENC=Linux\x207.2.4-arch1-2\x20xhci-hcd
++E: ID_USB_VENDOR_ID=1d6b
++E: ID_VENDOR=Linux_7.2.4-arch1-2_xhci-hcd
++E: ID_VENDOR_ENC=Linux\x207.2.4-arch1-2\x20xhci-hcd
++E: ID_VENDOR_FROM_DATABASE=Linux Foundation
++E: ID_VENDOR_ID=1d6b
++E: MAJOR=189
++E: MINOR=0
++E: PRODUCT=1d6b/2/702
++E: SUBSYSTEM=usb
++E: TAGS=:seat:
++E: TYPE=9/0/1
++A: authorized=1\n
++A: authorized_default=1\n
++A: avoid_reset_quirk=0\n
++A: bConfigurationValue=1\n
++A: bDeviceClass=09\n
++A: bDeviceProtocol=01\n
++A: bDeviceSubClass=00\n
++A: bMaxPacketSize0=64\n
++A: bMaxPower=0mA\n
++A: bNumConfigurations=1\n
++A: bNumInterfaces= 1\n
++A: bcdDevice=0702\n
++A: bmAttributes=e0\n
++A: busnum=1\n
++A: configuration=
++H: descriptors=12010002090001406B1D020002070302010109021900010100E0000904000001090000000705810304000C
++A: dev=189:0\n
++A: devnum=1\n
++A: devpath=0\n
++L: driver=../../../../../bus/usb/drivers/usb
++L: firmware_node=../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17/device:23/device:24
++A: idProduct=0002\n
++A: idVendor=1d6b\n
++A: interface_authorized_default=1\n
++A: ltm_capable=no\n
++A: manufacturer=Linux 7.2.4-arch1-2 xhci-hcd\n
++A: maxchild=5\n
++A: power/active_duration=21820915\n
++A: power/autosuspend=0\n
++A: power/autosuspend_delay_ms=0\n
++A: power/connected_duration=25152871\n
++A: power/control=auto\n
++A: power/level=auto\n
++A: power/runtime_active_time=21820914\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=3331956\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: product=xHCI Host Controller\n
++A: quirks=0x0\n
++A: removable=unknown\n
++A: rx_lanes=1\n
++A: serial=0000:63:00.3\n
++A: speed=480\n
++A: tx_lanes=1\n
++A: urbnum=705\n
++A: version= 2.00\n
++
++P: /devices/pci0000:00/0000:00:08.1/0000:63:00.3
++E: DRIVER=xhci_hcd
++E: ID_PATH=pci-0000:63:00.3
++E: ID_PATH_TAG=pci-0000_63_00_3
++E: ID_PCI_CLASS_FROM_DATABASE=Serial bus controller
++E: ID_PCI_INTERFACE_FROM_DATABASE=XHCI
++E: ID_PCI_SUBCLASS_FROM_DATABASE=USB controller
++E: ID_VENDOR_FROM_DATABASE=Advanced Micro Devices, Inc. [AMD]
++E: MODALIAS=pci:v00001022d000015B9sv00001022sd000015B9bc0Csc03i30
++E: PCI_CLASS=C0330
++E: PCI_ID=1022:15B9
++E: PCI_SLOT_NAME=0000:63:00.3
++E: PCI_SUBSYS_ID=1022:15B9
++E: SUBSYSTEM=pci
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x0c0330\n
++H: config=2210B915070410000030030C10008000040020780000000000000000000000000000000000000000000000002210B915000000004800000000000000FF0400000000000000000000095008002210B915016403C80000000000000000000000003160000010A00200A18F000010290000040D400040000411000000000000000000000000000000001F007100000000001E00800100000100000000000000000005C08000000000000000000000000000000000000000000000000000000000001100008000E00F0000F00F00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000B00012A010001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++A: consistent_dma_mask_bits=64\n
++A: current_link_speed=16.0 GT/s PCIe\n
++A: current_link_width=16\n
++A: d3cold_allowed=1\n
++A: dbc=disabled\n
++A: dbc_bInterfaceProtocol=01\n
++A: dbc_bcdDevice=0010\n
++A: dbc_idProduct=0010\n
++A: dbc_idVendor=1d6b\n
++A: dbc_manufacturer=Linux Foundation\n
++A: dbc_poll_interval_ms=64\n
++A: dbc_product=Linux USB Debug Target\n
++A: dbc_serial=0001\n
++A: device=0x15b9\n
++A: dma_mask_bits=64\n
++L: driver=../../../../bus/pci/drivers/xhci_hcd
++A: driver_override=(null)\n
++A: enable=1\n
++L: firmware_node=../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17/device:23
++L: iommu=../../0000:00:00.2/iommu/ivhd0
++L: iommu_group=../../../../kernel/iommu_groups/19
++A: irq=45\n
++A: link/l0s_aspm=0\n
++A: link/l1_aspm=0\n
++A: local_cpulist=0-15\n
++A: local_cpus=ffff\n
++A: max_link_speed=16.0 GT/s PCIe\n
++A: max_link_width=16\n
++A: modalias=pci:v00001022d000015B9sv00001022sd000015B9bc0Csc03i30\n
++A: msi_bus=1\n
++A: msi_irqs/46=msix\n
++A: numa_node=-1\n
++A: pools=poolinfo - 0.1\nbuffer-2048         0    0 2048  0\nbuffer-512          0    0  512  0\nbuffer-128          0    0  128  0\nbuffer-32           0    0   32  0\nxHCI 256 port bw ctx arrays    0    0  256  0\nxHCI 1KB stream ctx arrays    0    0 1024  0\nxHCI 256 byte stream ctx arrays    0    0  256  0\nxHCI input/output contexts    4    5 2112  5\nxHCI ring segments   25   29 4096 29\nbuffer-2048         0    0 2048  0\nbuffer-512          0    8  512  1\nbuffer-128          0    0  128  0\nbuffer-32           0    0   32  0\n
++A: power/control=auto\n
++A: power/runtime_active_time=21821680\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=3331381\n
++A: power/wakeup=enabled\n
++A: power/wakeup_abort_count=0\n
++A: power/wakeup_active=0\n
++A: power/wakeup_active_count=0\n
++A: power/wakeup_count=0\n
++A: power/wakeup_expire_count=0\n
++A: power/wakeup_last_time_ms=0\n
++A: power/wakeup_max_time_ms=0\n
++A: power/wakeup_total_time_ms=0\n
++A: power_state=D0\n
++A: reset_method=pm\n
++A: resource=0x0000000078200000 0x00000000782fffff 0x0000000000140204\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x00\n
++A: subsystem_device=0x15b9\n
++A: subsystem_vendor=0x1022\n
++A: vendor=0x1022\n
++
++P: /devices/pci0000:00/0000:00:08.1
++E: DRIVER=pcieport
++E: ID_MODEL_FROM_DATABASE=Phoenix Internal GPP Bridge to Bus [C:A]
++E: ID_PATH=pci-0000:00:08.1
++E: ID_PATH_TAG=pci-0000_00_08_1
++E: ID_PCI_CLASS_FROM_DATABASE=Bridge
++E: ID_PCI_INTERFACE_FROM_DATABASE=Normal decode
++E: ID_PCI_SUBCLASS_FROM_DATABASE=PCI bridge
++E: ID_VENDOR_FROM_DATABASE=Advanced Micro Devices, Inc. [AMD]
++E: MODALIAS=pci:v00001022d000014EBsv00001022sd000014EBbc06sc04i00
++E: PCI_CLASS=60400
++E: PCI_ID=1022:14EB
++E: PCI_SLOT_NAME=0000:00:08.1
++E: PCI_SUBSYS_ID=1022:14EB
++E: SUBSYSTEM=pci
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x060400\n
++H: config=2210EB140704100000000406100081000000000000000000006363001111000000785078010071107C0000007C000000000000005000000000000000FF01020000000000000000000000000000000000015803C80000000010A042002280000010290000040D7000400C04310000000000004000180001000000000040003100000000001E00800144001F00000000000000000000000000000000000000000005C081000000E0FE0000000000000000000000000000000000000000000000000D0000002210EB1400000000000000000000000000000000000000000000000000000000FC27FF9F0000000000000000000000000000000000000000000000000B000127010001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001900012A00000000000000007F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F000000000D0001405F001D000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000250001410100008001000080000000002600014500000000000000000F00000000000000000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000000000000000000000000000002700010000000000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C0000389C000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++A: consistent_dma_mask_bits=32\n
++A: current_link_speed=16.0 GT/s PCIe\n
++A: current_link_width=16\n
++A: d3cold_allowed=1\n
++A: device=0x14eb\n
++A: dma_mask_bits=32\n
++L: driver=../../../bus/pci/drivers/pcieport
++A: driver_override=(null)\n
++A: enable=2\n
++L: firmware_node=../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:17
++L: iommu=../0000:00:00.2/iommu/ivhd0
++L: iommu_group=../../../kernel/iommu_groups/8
++A: irq=42\n
++A: local_cpulist=0-15\n
++A: local_cpus=ffff\n
++A: max_link_speed=16.0 GT/s PCIe\n
++A: max_link_width=16\n
++A: modalias=pci:v00001022d000014EBsv00001022sd000014EBbc06sc04i00\n
++A: msi_bus=1\n
++A: msi_irqs/42=msi\n
++A: numa_node=-1\n
++A: power/autosuspend_delay_ms=100\n
++A: power/control=auto\n
++A: power/runtime_active_time=25153067\n
++A: power/runtime_status=active\n
++A: power/runtime_suspended_time=0\n
++A: power/wakeup=disabled\n
++A: power/wakeup_abort_count=\n
++A: power/wakeup_active=\n
++A: power/wakeup_active_count=\n
++A: power/wakeup_count=\n
++A: power/wakeup_expire_count=\n
++A: power/wakeup_last_time_ms=\n
++A: power/wakeup_max_time_ms=\n
++A: power/wakeup_total_time_ms=\n
++A: power_state=D0\n
++A: reset_method=pm\n
++A: resource=0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000001000 0x0000000000001fff 0x0000000000000101\n0x0000000078000000 0x00000000785fffff 0x0000000000000200\n0x0000007c00000000 0x0000007c107fffff 0x0000000000102201\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x00\n
++A: secondary_bus_number=99\n
++A: subordinate_bus_number=99\n
++A: subsystem_device=0x14eb\n
++A: subsystem_vendor=0x1022\n
++A: vendor=0x1022\n
++
+diff --git a/tests/test-omsmoc-proto.c b/tests/test-omsmoc-proto.c
+new file mode 100644
+index 0000000..2a1688d
+--- /dev/null
++++ b/tests/test-omsmoc-proto.c
+@@ -0,0 +1,273 @@
++/*
++ * omsmoc 帧编解码的单元测试（不需要硬件）
++ *
++ * 只测试 omsmoc/omsmoc_proto.c 里的纯函数：帧构造、帧解析、空包判断。
++ * 这些用例覆盖了驱动与芯片通信里最容易出错的边界：长度、magic、
++ * 校验和、截断包、空负载。
++ *
++ * 两种跑法：
++ *   driver/tests/run-proto-tests.sh          单文件编译，不依赖 libfprint 源码树
++ *   meson test -C build/libfprint-build omsmoc-proto   在 libfprint 树里跑
++ */
++
++#include <glib.h>
++#include "omsmoc_proto.h"
++
++/* 在 libfprint 源码树里编译时，整个项目带 -DG_LOG_DOMAIN="libfprint"，
++ * 警告的日志域就是 libfprint；独立编译时域是 NULL。
++ * g_test_expect_message() 必须用同一个域才能匹配到预期日志。 */
++#ifndef G_LOG_DOMAIN
++#define G_LOG_DOMAIN NULL
++#endif
++
++/* 构造一个应答帧（kind=0x07），用于喂给 oms_parse_frame()。 */
++static gsize
++build_response (guint8        *buf,
++                const guint8  *payload,
++                gsize          payload_len)
++{
++  gsize frame_len = payload_len + OMS_FRAME_TRAILER_SIZE;
++  guint16 checksum = 0;
++  gsize i;
++
++  g_assert_cmpuint (OMS_FRAME_HEADER_SIZE + frame_len, <=, OMS_PACKET_SIZE);
++
++  memset (buf, 0x00, OMS_PACKET_SIZE);
++  buf[0] = 0xef;
++  buf[1] = 0x01;
++  buf[2] = 0xff;
++  buf[3] = 0xff;
++  buf[4] = 0xff;
++  buf[5] = 0xff;
++  buf[6] = OMS_FRAME_KIND_RESPONSE;
++  buf[7] = 0x00;
++  buf[8] = frame_len;
++  if (payload_len > 0)
++    memcpy (&buf[OMS_FRAME_HEADER_SIZE], payload, payload_len);
++
++  for (i = 6; i < OMS_FRAME_HEADER_SIZE + frame_len - OMS_FRAME_TRAILER_SIZE; i++)
++    checksum += buf[i];
++
++  buf[OMS_FRAME_HEADER_SIZE + frame_len - 2] = (checksum >> 8) & 0xff;
++  buf[OMS_FRAME_HEADER_SIZE + frame_len - 1] = checksum & 0xff;
++
++  return OMS_FRAME_HEADER_SIZE + frame_len;
++}
++
++static void
++test_constants (void)
++{
++  g_assert_cmpuint (OMS_FRAME_HEADER_SIZE, ==, 9);
++  g_assert_cmpuint (OMS_FRAME_TRAILER_SIZE, ==, 2);
++  g_assert_cmpuint (OMS_MAX_PARAM_SIZE, ==, 52);
++  /* 满负载时整帧正好填满一个 USB 包 */
++  g_assert_cmpuint (OMS_FRAME_HEADER_SIZE + 1 + OMS_MAX_PARAM_SIZE +
++                    OMS_FRAME_TRAILER_SIZE, ==, OMS_PACKET_SIZE);
++}
++
++static void
++test_build_no_params (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  gsize len = oms_build_frame (buf, 0x34, NULL, 0);
++
++  g_assert_cmpuint (len, ==, 12);            /* 9 + (1 + 0 + 2) */
++  g_assert_cmpuint (buf[0], ==, 0xef);
++  g_assert_cmpuint (buf[1], ==, 0x01);
++  g_assert_cmpuint (buf[6], ==, OMS_FRAME_KIND_REQUEST);
++  g_assert_cmpuint (buf[7], ==, 0x00);
++  g_assert_cmpuint (buf[8], ==, 3);          /* 负载 + 校验和 */
++  g_assert_cmpuint (buf[9], ==, 0x34);
++  /* 校验和 = 0x01 + 0x00 + 0x03 + 0x34 */
++  g_assert_cmpuint (buf[10], ==, 0x00);
++  g_assert_cmpuint (buf[11], ==, 0x38);
++  /* 包尾必须补零到 64 字节 */
++  g_assert_cmpuint (buf[12], ==, 0x00);
++  g_assert_cmpuint (buf[63], ==, 0x00);
++}
++
++static void
++test_build_with_params (void)
++{
++  static const guint8 params[] = { 0x00, 0x01, 0x06, 0x00, 0x00 };
++  guint8 buf[OMS_PACKET_SIZE];
++  gsize len = oms_build_frame (buf, 0x32, params, sizeof params);
++
++  g_assert_cmpuint (len, ==, 17);            /* 9 + (1 + 5 + 2) */
++  g_assert_cmpuint (buf[8], ==, 8);
++  g_assert_cmpuint (buf[9], ==, 0x32);
++  g_assert_true (memcmp (&buf[10], params, sizeof params) == 0);
++  g_assert_cmpuint (buf[15], ==, 0x00);      /* 参数之后才是校验和 */
++}
++
++static void
++test_build_full_payload (void)
++{
++  guint8 params[OMS_MAX_PARAM_SIZE];
++  guint8 buf[OMS_PACKET_SIZE];
++  gsize len;
++
++  memset (params, 0xa5, sizeof params);
++  len = oms_build_frame (buf, 0x31, params, sizeof params);
++
++  g_assert_cmpuint (len, ==, OMS_PACKET_SIZE);
++  g_assert_true (memcmp (&buf[10], params, sizeof params) == 0);
++}
++
++static void
++test_build_rejects_oversized (void)
++{
++  guint8 params[OMS_MAX_PARAM_SIZE + 1];
++  guint8 buf[OMS_PACKET_SIZE];
++
++  memset (params, 0, sizeof params);
++  /* 必须返回 0，且不能越界写。g_return_val_if_fail 会打一条 critical，
++   * 在 GLib 测试框架下 critical 默认是致命的，所以先声明预期消息。 */
++  g_test_expect_message (G_LOG_DOMAIN, G_LOG_LEVEL_CRITICAL, "*params_len*");
++  g_assert_cmpuint (oms_build_frame (buf, 0x31, params, sizeof params), ==, 0);
++  g_test_assert_expected_messages ();
++}
++
++static void
++test_parse_roundtrip (void)
++{
++  static const guint8 payload[] = { 0x00, 0x05, 0x00, 0x00, 0x03, 0xe8 };
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++  gsize len = build_response (buf, payload, sizeof payload);
++
++  g_assert_true (oms_parse_frame (buf, len, &out, &out_len));
++  g_assert_cmpuint (out_len, ==, sizeof payload);
++  g_assert_true (out == &buf[OMS_FRAME_HEADER_SIZE]);
++  g_assert_true (memcmp (out, payload, sizeof payload) == 0);
++}
++
++static void
++test_parse_accepts_empty_payload (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++  gsize len = build_response (buf, NULL, 0);
++
++  g_assert_cmpuint (len, ==, OMS_FRAME_HEADER_SIZE + OMS_FRAME_TRAILER_SIZE);
++  g_assert_true (oms_parse_frame (buf, len, &out, &out_len));
++  g_assert_cmpuint (out_len, ==, 0);
++}
++
++static void
++test_parse_rejects_short_buffer (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++  gsize len = build_response (buf, NULL, 0);
++
++  /* 只有 8 字节，连帧头都不完整 */
++  g_assert_false (oms_parse_frame (buf, OMS_FRAME_HEADER_SIZE - 1, &out, &out_len));
++  /* 完整帧，但只交付了 len-1 字节 */
++  g_assert_false (oms_parse_frame (buf, len - 1, &out, &out_len));
++}
++
++static void
++test_parse_rejects_bad_magic (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++  gsize len = build_response (buf, NULL, 0);
++
++  buf[0] = 0xee;
++  g_assert_false (oms_parse_frame (buf, len, &out, &out_len));
++}
++
++static void
++test_parse_rejects_request_kind (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++  gsize len = oms_build_frame (buf, 0x34, NULL, 0);
++
++  /* 请求帧不能被当作应答接受 */
++  g_assert_false (oms_parse_frame (buf, len, &out, &out_len));
++}
++
++static void
++test_parse_rejects_short_frame_len (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++
++  build_response (buf, NULL, 0);
++  buf[8] = 0;                               /* 小于 trailer */
++  g_assert_false (oms_parse_frame (buf, OMS_PACKET_SIZE, &out, &out_len));
++
++  build_response (buf, NULL, 0);
++  buf[8] = 1;
++  g_assert_false (oms_parse_frame (buf, OMS_PACKET_SIZE, &out, &out_len));
++}
++
++static void
++test_parse_rejects_truncated_frame (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++
++  build_response (buf, NULL, 0);
++  buf[8] = 60;                              /* 声明长度超过实际交付 */
++  g_assert_false (oms_parse_frame (buf, OMS_PACKET_SIZE, &out, &out_len));
++}
++
++static void
++test_parse_rejects_bad_checksum (void)
++{
++  guint8 buf[OMS_PACKET_SIZE];
++  const guint8 *out = NULL;
++  gsize out_len = 0;
++  gsize len = build_response (buf, NULL, 0);
++
++  buf[len - 1] ^= 0xff;
++  /* 校验和不符时解析器会打一条 warning（GLib 测试里致命），先声明预期消息 */
++  g_test_expect_message (G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, "*checksum mismatch*");
++  g_assert_false (oms_parse_frame (buf, len, &out, &out_len));
++  g_test_assert_expected_messages ();
++}
++
++static void
++test_data_is_empty (void)
++{
++  static const guint8 zeros[] = { 0, 0, 0, 0 };
++  static const guint8 mixed[] = { 0, 0, 1, 0 };
++
++  g_assert_true (oms_data_is_empty (zeros, sizeof zeros));
++  g_assert_false (oms_data_is_empty (mixed, sizeof mixed));
++  /* 零长度视为空 */
++  g_assert_true (oms_data_is_empty (zeros, 0));
++}
++
++int
++main (int argc, char **argv)
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/omsmoc/proto/constants", test_constants);
++  g_test_add_func ("/omsmoc/proto/build/no-params", test_build_no_params);
++  g_test_add_func ("/omsmoc/proto/build/with-params", test_build_with_params);
++  g_test_add_func ("/omsmoc/proto/build/full-payload", test_build_full_payload);
++  g_test_add_func ("/omsmoc/proto/build/oversized", test_build_rejects_oversized);
++  g_test_add_func ("/omsmoc/proto/parse/roundtrip", test_parse_roundtrip);
++  g_test_add_func ("/omsmoc/proto/parse/empty-payload", test_parse_accepts_empty_payload);
++  g_test_add_func ("/omsmoc/proto/parse/short-buffer", test_parse_rejects_short_buffer);
++  g_test_add_func ("/omsmoc/proto/parse/bad-magic", test_parse_rejects_bad_magic);
++  g_test_add_func ("/omsmoc/proto/parse/request-kind", test_parse_rejects_request_kind);
++  g_test_add_func ("/omsmoc/proto/parse/short-frame-len", test_parse_rejects_short_frame_len);
++  g_test_add_func ("/omsmoc/proto/parse/truncated", test_parse_rejects_truncated_frame);
++  g_test_add_func ("/omsmoc/proto/parse/bad-checksum", test_parse_rejects_bad_checksum);
++  g_test_add_func ("/omsmoc/proto/data-is-empty", test_data_is_empty);
++
++  return g_test_run ();
++}

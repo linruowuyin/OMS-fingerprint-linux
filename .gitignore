@@ -1,0 +1,26 @@
+# 构建产物
+build/
+aur/*/src/
+aur/*/build/
+meson-logs/
+meson-private/
+*.o
+*.so
+*.so.*
+*.a
+
+# AUR 打包产物（不入库，AUR 只需 PKGBUILD + .SRCINFO + patch）
+aur/*/pkg/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+
+# 上游源码 tarball（PKGBUILD 里按 checksum 下载，不入库）
+*.tar.gz
+
+# 本地发布备忘（含个人路径与发布计划）
+aur/libfprint-omsmoc-wujie14pro/PUBLISH.md
+
+# 编辑器与系统
+*.swp
+*~
+.DS_Store

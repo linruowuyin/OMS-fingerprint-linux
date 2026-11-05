@@ -1,0 +1,8 @@
+# OMS 33a7:2388 指纹传感器
+#
+# 这颗芯片扛不住内核 autosuspend：一旦被挂起，驱动下次访问就可能失败。
+# 所以这里强制常供电（代价是待机多耗 1–3%）。
+#
+# 不要加 TAG+="uaccess"：fprintd 以 root 运行，本来就不需要；
+# 加了等于把设备直连权限（含删除芯片模板）开放给所有本地用户。
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="33a7", ATTR{idProduct}=="2388", ATTR{power/control}="on"
