@@ -27,13 +27,13 @@ here: `fprintd-enroll` completes its six stages and `fprintd-verify` returns
 `verify-match`; an unenrolled finger correctly returns `verify-no-match`.
 
 Repository (documentation, driver, bring-up tool, umockdev test):
-https://github.com/BlueApple233/OMS-fingerprint-linux
+https://github.com/linruowuyin/OMS-fingerprint-linux
 
 Direct patch against master (single commit, driver + test case + hwdb):
-https://github.com/BlueApple233/OMS-fingerprint-linux/blob/main/driver/upstream/0001-drivers-Add-support-for-OMS-match-on-chip-sensors.patch
+https://github.com/linruowuyin/OMS-fingerprint-linux/blob/main/driver/upstream/0001-drivers-Add-support-for-OMS-match-on-chip-sensors.patch
 
 Arch package as a stop-gap for users (built from the patch above):
-https://github.com/BlueApple233/OMS-fingerprint-linux/tree/main/aur/libfprint-omsmoc
+https://github.com/linruowuyin/OMS-fingerprint-linux/tree/main/aur/libfprint-omsmoc
 
 ### Protocol
 

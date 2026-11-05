@@ -4,14 +4,14 @@
 # The driver itself is submitted upstream; this package is the fallback for
 # users whose device is not supported by the distribution package yet.
 #
-# See https://github.com/BlueApple233/OMS-fingerprint-linux
+# See https://github.com/linruowuyin/OMS-fingerprint-linux
 
 pkgname=libfprint-omsmoc
 pkgver=1.94.100
 pkgrel=2
 pkgdesc="Library to access fingerprint readers, with the OMS match-on-chip driver (33a7:2388)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/BlueApple233/OMS-fingerprint-linux"
+url="https://github.com/linruowuyin/OMS-fingerprint-linux"
 license=('LGPL-2.1-or-later')
 depends=('glib2' 'libgudev' 'libgusb' 'libusb' 'openssl' 'pixman' 'cairo')
 makedepends=('meson' 'ninja' 'gobject-introspection' 'glib2-devel')

@@ -6,7 +6,10 @@
 ## 来源与许可
 
 驱动本体来自 [BlueApple233/OMS-fingerprint-linux](https://github.com/BlueApple233/OMS-fingerprint-linux)，
-许可 LGPL-2.1-or-later（见 `LICENSE`）。本补丁是它的修改版，改动如下：
+许可 LGPL-2.1-or-later（见 `LICENSE`）。
+
+本仓库（[linruowuyin/OMS-fingerprint-linux](https://github.com/linruowuyin/OMS-fingerprint-linux)）
+是它的衍生版本，本补丁为其修改版，改动如下：
 
 1. 协议层拆到 `libfprint/drivers/omsmoc/omsmoc_proto.c`（布局与 `goodixmoc` 等一致）
 2. 新增 `tests/test-omsmoc-proto.c`（14 个用例），注册进 meson 的 `unit-tests`
