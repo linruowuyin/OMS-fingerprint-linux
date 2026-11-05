@@ -1,14 +1,19 @@
-# Maintainer: BlueApple233 <blueapple233_@outlook.com>
+# Maintainer: lrwy <lrwy@users.noreply.github.com>
 #
 # libfprint with the OMS match-on-chip driver (USB 33a7:2388) added.
 # The driver itself is submitted upstream; this package is the fallback for
 # users whose device is not supported by the distribution package yet.
 #
-# See https://github.com/linruowuyin/OMS-fingerprint-linux
+# Driver:   https://github.com/linruowuyin/OMS-fingerprint-linux
+# Patches:  https://github.com/linruowuyin/omsmoc-patches
+#
+# The driver originates from BlueApple233/OMS-fingerprint-linux
+# (LGPL-2.1-or-later). See the README of the driver repository for the
+# full attribution.
 
 pkgname=libfprint-omsmoc
 pkgver=1.94.100
-pkgrel=2
+pkgrel=1
 pkgdesc="Library to access fingerprint readers, with the OMS match-on-chip driver (33a7:2388)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/linruowuyin/OMS-fingerprint-linux"
@@ -20,12 +25,13 @@ provides=('libfprint' 'libfprint-2.so=2-64')
 # fingerprint-gui 等包继续使用，不该被本包顶掉。
 conflicts=('libfprint>=1.90')
 options=('!emptydirs')
+# 补丁托管在 GitHub 的 raw 链接上（AUR 不允许随包携带本地文件）。
+# tag 与 libfprint 版本对应，保证内容可复现且校验和稳定。
+_ghuser=linruowuyin
 source=("https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v$pkgver/libfprint-v$pkgver.tar.gz"
-        "omsmoc-driver.patch"
-        "70-oms-fingerprint.rules")
+        "https://raw.githubusercontent.com/$_ghuser/omsmoc-patches/v$pkgver/omsmoc-driver.patch")
 sha256sums=('edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c'
-            '181e3ab5d960e07763dcd45c271ef9b154a5ee7ba37a4e83320248a34b6979f2'
-            '17dd648e4182eac217d4db1e035b0e751925ff2e7b32f696bc962bf99620d220')
+            '181e3ab5d960e07763dcd45c271ef9b154a5ee7ba37a4e83320248a34b6979f2')
 
 prepare() {
   cd "libfprint-v$pkgver"
@@ -34,6 +40,9 @@ prepare() {
 
 build() {
   cd "libfprint-v$pkgver"
+  # 抹掉构建机的本地路径：否则调试信息里会留下维护者的主目录名。
+  export CFLAGS="${CFLAGS} -ffile-prefix-map=$PWD=."
+  export CXXFLAGS="${CXXFLAGS} -ffile-prefix-map=$PWD=."
   meson setup build \
     --prefix=/usr \
     --buildtype=release \
@@ -44,13 +53,38 @@ build() {
     -Dudev_rules=enabled \
     -Dudev_hwdb=enabled
   meson compile -C build
+
+  # libfprint 的 fpi-device.c 会 include 由 meson configure_file 生成的
+  # tests/fpi-test-emulation.h，其中硬编码了构建目录的绝对路径。这个字符串
+  # 会被编进主库并随包分发，泄露维护者的本地路径。
+  # -ffile-prefix-map 对它无效（那是编译期宏替换），只能直接改生成的头文件。
+  local emulation_header="build/tests/fpi-test-emulation.h"
+  if [[ -f "$emulation_header" ]]; then
+    local build_dir
+    build_dir=$(sed -n 's|^#define FPI_EMULATION_HELPER_BUILDDIR "\(.*\)"$|\1|p' "$emulation_header")
+    if [[ -n "$build_dir" ]]; then
+      sed -i "s|$build_dir|/usr/libexec/libfprint-2-tests|" "$emulation_header"
+      meson compile -C build
+    fi
+  fi
+}
+
+check() {
+  cd "libfprint-v$pkgver"
+  # 只跑协议层单元测试：不需要硬件，也不需要 umockdev
+  meson test -C build omsmoc-proto --print-errorlogs
 }
 
 package() {
   cd "libfprint-v$pkgver"
   meson install -C build --destdir "$pkgdir"
 
-  # 这颗芯片扛不住 autosuspend，必须常供电；规则随包安装，装完即可用。
-  install -Dm644 "$srcdir/70-oms-fingerprint.rules" \
-    "$pkgdir/usr/lib/udev/rules.d/70-oms-fingerprint.rules"
+  # 这颗芯片扛不住 autosuspend，必须常供电。
+  # 不加 uaccess：fprintd 以 root 运行，加了等于把设备直连权限开放给所有本地用户。
+  install -Dm644 /dev/stdin "$pkgdir/usr/lib/udev/rules.d/70-oms-fingerprint.rules" <<'EOF'
+# OMS 33a7:2388 指纹传感器：必须常供电（芯片扛不住内核 autosuspend）。
+# 不要加 TAG+="uaccess"：fprintd 以 root 运行，加了等于把设备直连权限
+# （含删除芯片模板）开放给所有本地用户。
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="33a7", ATTR{idProduct}=="2388", ATTR{power/control}="on"
+EOF
 }
