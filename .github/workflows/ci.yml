@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  protocol-unit-tests:
+    name: EF01 frame codec unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev pkg-config
+
+      - name: Compile with -Werror and run the test suite
+        run: bash driver/tests/run-proto-tests.sh --verbose
+
+  shell-and-python:
+    name: Script lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck and python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck python3
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning \
+            driver/tests/run-proto-tests.sh \
+            driver/setup.sh
+
+      - name: python syntax check
+        run: |
+          python3 -m py_compile \
+            driver/tests/sanitize-capture.py \
+            driver/tests/omsmoc/custom.py
+          echo "python files compile"
+
+  compliance:
+    name: License and attribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every source file must carry an SPDX identifier
+        run: |
+          missing=0
+          for f in $(git ls-files 'driver/**/*.c' 'driver/**/*.h'); do
+            if ! grep -q 'SPDX-License-Identifier: LGPL-2.1-or-later' "$f"; then
+              echo "::error::missing SPDX identifier: $f"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+          echo "all source files carry the SPDX identifier"
+
+      - name: Derivative sources must state the origin
+        run: |
+          missing=0
+          for f in $(git ls-files 'driver/**/*.c' 'driver/**/*.h'); do
+            if ! grep -q 'Modifications (2026-10-28)' "$f"; then
+              echo "::error::missing modification notice: $f"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+          echo "all derivative sources state the origin"
+
+      - name: README must document the attribution
+        run: |
+          grep -q '^## Attribution' README.md
+          grep -q 'BlueApple233/OMS-fingerprint-linux' README.md
+          echo "README documents the attribution"
+
+      - name: No vendor binaries or raw captures
+        run: |
+          # AUR packages, upstream tarballs and build output must not be tracked
+          if git ls-files | grep -E '\.pkg\.tar\.zst$|\.tar\.gz$|^build/'; then
+            echo "::error::build artifacts are tracked"
+            exit 1
+          fi
+          echo "no build artifacts tracked"
+
+      - name: No local absolute paths
+        run: |
+          if git ls-files -z | xargs -0 grep -InE '/home/[a-z][a-z0-9_-]*/' 2>/dev/null; then
+            echo "::error::local absolute paths found"
+            exit 1
+          fi
+          echo "no local absolute paths"
